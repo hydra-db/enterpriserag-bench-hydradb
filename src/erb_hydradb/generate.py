@@ -10,29 +10,40 @@ For each question:
   4. the top ``submit_docs`` document ids are written to ``answers.jsonl`` in the
      benchmark's submission format.
 
-Every checkpoint row carries an explicit ``stage``:
+Run directory layout and evidence rules:
 
-  retrieved   retrieval done, no answer requested (``--retrieval-only``)
-  answered    retrieval done and an answer produced
-  error       the row failed (``error`` says where); retried on resume
+  gen_checkpoint.json      one row per question with an explicit ``stage``
+                           (retrieved | answered | error); header binds the run
+                           identity (config fingerprint, prompts, endpoint,
+                           questions file hash, contexts file hash for replay,
+                           document-store identity)
+  contexts.attempts.jsonl  append-only attempt history: every context ever sent
+                           to the model, with attempt number and timestamp,
+                           written BEFORE the checkpoint row that depends on it
+  contexts.jsonl.gz        the authoritative contexts, exactly one per completed
+                           question, materialised from the attempt history at
+                           the end of every run (the row whose sha256 the
+                           checkpoint records)
+  answers.jsonl            submission format, one row per non-error question
+  manifest.json            one record per stage; file hashes are as of that stage
 
 A run is COMPLETE only when every requested question has an ``answered`` row
 (or ``retrieved`` in retrieval-only mode). ``run_generate`` returns the rows and
 a completeness verdict; the CLI exits nonzero on an incomplete run unless
 ``--allow-partial`` is given. Resuming a retrieval-only checkpoint in generation
-mode reuses the saved retrieval order and generates the missing answers; it
-never counts a ``retrieved`` row as an answer.
+mode reuses the saved retrieval order and the SAVED context (not a rebuild) and
+generates the missing answers; it never counts a ``retrieved`` row as an answer.
 
 Replaying published contexts (``--from-contexts``) validates the file before any
 model call: schema, unique ids, coverage of the requested questions, the actual
 sha256 of every context, its declared length, and the absence of benchmark
-markers. The run identity (checkpoint fingerprint) binds the configuration,
-the operation mode, the questions file and, for replay, the contexts file.
+markers.
 """
 
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import os
@@ -43,6 +54,9 @@ from . import hydrate, manifest, validate
 from .config import RunConfig
 from .llm import complete
 from .prompts import CRITIQUE_PROMPT, PASS1_PROMPT, PASS2_PROMPT, PROMPTS_VERSION
+
+ATTEMPTS = "contexts.attempts.jsonl"
+CONTEXTS = "contexts.jsonl.gz"
 
 
 class IncompleteRun(RuntimeError):
@@ -98,18 +112,21 @@ def generate_answer(question: str, context: str, cfg: RunConfig) -> tuple[str, d
 
 # ---------------------------------------------------------- identity ----
 
-def run_identity(cfg: RunConfig, *, questions_path: Path | None, from_contexts: Path | None) -> dict:
-    """What a checkpoint is bound to. Operation mode is NOT part of it, so a
-    retrieval-only checkpoint can be continued into generation; the stage
-    field on each row records what was actually done."""
+def run_identity(cfg: RunConfig, *, questions_path: Path | None, from_contexts: Path | None,
+                 store_identity: dict | None = None) -> dict:
+    """What a checkpoint is bound to: configuration, prompts, endpoint, the
+    questions file, the contexts file (replay) and the document store. The
+    operation mode is NOT part of it, so a retrieval-only checkpoint can be
+    continued into generation; each row's ``stage`` records what was done."""
     ident = {
         "fingerprint": cfg.generation_fingerprint(),
         "prompts": PROMPTS_VERSION,
         "base_url": cfg.hydradb.base_url,
         "questions_sha256": manifest.sha256_file(questions_path) if questions_path else None,
         "contexts_sha256": manifest.sha256_file(from_contexts) if from_contexts else None,
+        "document_store": store_identity or None,
     }
-    ident["identity"] = hashlib.sha256(json.dumps(ident, sort_keys=True).encode()).hexdigest()
+    ident["identity"] = hashlib.sha256(json.dumps(ident, sort_keys=True, default=str).encode()).hexdigest()
     return ident
 
 
@@ -139,10 +156,12 @@ def load_checkpoint(path: Path, identity: dict, force: bool) -> tuple[list[dict]
 
 def write_answers(rows: list[dict], out: Path) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w", encoding="utf-8") as f:
+    tmp = out.with_suffix(".jsonl.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps({"question_id": r["question_id"], "answer": r.get("answer", ""),
                                 "document_ids": r.get("document_ids", [])}) + "\n")
+    os.replace(tmp, out)
     return len(rows)
 
 
@@ -161,36 +180,93 @@ def load_published_contexts(path: Path, requested: list[dict]) -> dict[str, dict
     return {r["question_id"]: r for r in rows if r["question_id"] in expected}
 
 
+# ------------------------------------------------------- context files ----
+
+def saved_context(run_dir: Path, qid: str, sha256: str | None) -> dict | None:
+    """The attempt-history row for ``qid`` whose actual text hashes to ``sha256``
+    (or the latest row when no hash is given)."""
+    path = run_dir / ATTEMPTS
+    if not path.exists():
+        return None
+    found = None
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r.get("question_id") != qid:
+                continue
+            if sha256 is None or validate.sha256_text(r.get("context", "")) == sha256:
+                found = r
+    return found
+
+
+def materialise_contexts(run_dir: Path, rows: list[dict]) -> Path:
+    """Write ``contexts.jsonl.gz``: one row per completed checkpoint row, the
+    attempt whose actual sha256 equals the checkpoint's. Atomic."""
+    wanted = {r["question_id"]: r["context_sha256"] for r in rows
+              if r.get("stage") in ("retrieved", "answered") and r.get("context_sha256")}
+    chosen: dict[str, dict] = {}
+    path = run_dir / ATTEMPTS
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                r = json.loads(line)
+                qid = r.get("question_id")
+                if qid in wanted and validate.sha256_text(r.get("context", "")) == wanted[qid]:
+                    chosen[qid] = {k: r[k] for k in validate.CONTEXT_ROW_KEYS} | {"retrieved_doc_ids": r.get("retrieved_doc_ids", [])}
+    out = run_dir / CONTEXTS
+    tmp = run_dir / (CONTEXTS + ".tmp")
+    with gzip.open(tmp, "wt", encoding="utf-8") as f:
+        for qid in wanted:
+            if qid in chosen:
+                f.write(json.dumps(chosen[qid], ensure_ascii=False) + "\n")
+    os.replace(tmp, out)
+    missing = sorted(set(wanted) - set(chosen))
+    if missing:
+        raise RuntimeError(f"{len(missing)} completed rows have no saved context matching the checkpoint: {missing[:5]}")
+    return out
+
+
+# ------------------------------------------------------------- the run ----
+
 async def run_generate(cfg: RunConfig, run_dir: Path, questions: list[dict], *, api_key: str | None,
                        store: hydrate.DocumentStore | None, questions_path: Path | None = None,
                        retrieval_only: bool = False, from_contexts: Path | None = None,
-                       force_resume: bool = False) -> tuple[list[dict], IncompleteRun | None]:
+                       force_resume: bool = False, store_identity: dict | None = None) -> tuple[list[dict], IncompleteRun | None]:
     from .hydradb_client import HydraDBQueryClient
 
     run_dir.mkdir(parents=True, exist_ok=True)
     g, r = cfg.generation, cfg.retrieval
-    identity = run_identity(cfg, questions_path=questions_path, from_contexts=from_contexts)
+    if store_identity is None and store is not None:
+        store_identity = store.identity
+    identity = run_identity(cfg, questions_path=questions_path, from_contexts=from_contexts,
+                            store_identity=store_identity)
     ckpt = run_dir / "gen_checkpoint.json"
-    ctx_path = run_dir / "contexts.jsonl"
+    attempts_path = run_dir / ATTEMPTS
     rows, notes = load_checkpoint(ckpt, identity, force_resume)
     for n in notes:
         print(f"  resume: {n}", flush=True)
     by_id = {x["question_id"]: x for x in rows}
     requested_ids = [q["question_id"] for q in questions]
-    # rows that satisfy this run: answered always; retrieved only in retrieval-only mode
     done = {qid for qid, x in by_id.items() if x["stage"] == "answered" or (retrieval_only and x["stage"] == "retrieved")}
-    to_finish = [q for q in questions if q["question_id"] in by_id and q["question_id"] not in done]   # retrieved -> answer
+    to_finish = [q for q in questions if q["question_id"] in by_id and q["question_id"] not in done]
     to_query = [q for q in questions if q["question_id"] not in by_id]
     total = len(requested_ids)
     lock = asyncio.Lock()
     sem = asyncio.Semaphore(g.workers)
     counter = {"n": sum(1 for q in questions if q["question_id"] in done)}
+    attempt_no = {"n": 0}
+    if attempts_path.exists():
+        with open(attempts_path, "r", encoding="utf-8") as f:
+            attempt_no["n"] = sum(1 for line in f if line.strip())
 
     published: dict[str, dict] = {}
     if from_contexts:
         published = load_published_contexts(from_contexts, to_query + to_finish)
-        if store is None:
-            print(f"  replaying {len(published)} validated contexts from {from_contexts}", flush=True)
+        print(f"  replaying {len(published)} validated contexts from {from_contexts}", flush=True)
 
     def save():
         ordered = [by_id[q] for q in requested_ids if q in by_id] + [x for q, x in by_id.items() if q not in set(requested_ids)]
@@ -199,9 +275,16 @@ async def run_generate(cfg: RunConfig, run_dir: Path, questions: list[dict], *, 
             json.dump([{"_config": {**identity, "config": cfg.to_dict()}}] + ordered, f, ensure_ascii=False)
         os.replace(tmp, ckpt)
 
-    def dump_context(qid: str, ctx: dict):
-        with open(ctx_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"question_id": qid, **ctx}, ensure_ascii=False) + "\n")
+    def record_attempt(qid: str, ctx: dict, retrieved: list[str]):
+        """Durable evidence first: the context is on disk before the checkpoint
+        row that depends on it is written."""
+        attempt_no["n"] += 1
+        with open(attempts_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"question_id": qid, "attempt": attempt_no["n"], "recorded_at": manifest.now_iso(),
+                                **{k: ctx[k] for k in validate.CONTEXT_ROW_KEYS if k != "question_id"},
+                                "retrieved_doc_ids": retrieved}, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     async def query(client: HydraDBQueryClient, question: str) -> list[dict]:
         import httpx
@@ -243,24 +326,34 @@ async def run_generate(cfg: RunConfig, run_dir: Path, questions: list[dict], *, 
             print(f"    GEN ERROR {q['question_id']}: {str(exc)[:120]}", flush=True)
             return "", {}, f"gen: {str(exc)[:150]}"
 
-    async def commit(qid: str, row: dict, ctx: dict | None, q: dict):
+    async def commit(qid: str, row: dict, q: dict):
         async with lock:
             by_id[qid] = row
             counter["n"] += 1
             save()
-            if ctx is not None and not published:
-                dump_context(qid, {**ctx, "retrieved_doc_ids": row["retrieved_doc_ids"]})
             print(f"[{counter['n']}/{total}] {qid} [{q.get('question_type', '?')}] stage={row['stage']} "
                   f"docs={len(row['context_docs'])} ctx={row['context_chars']} ans_len={len(row['answer'])} "
                   f"{row['secs']:.0f}s" + (f" ERROR {row['error']}" if row.get("error") else ""), flush=True)
 
     async def finish_retrieved(q: dict):
-        """A retrieved row from an earlier retrieval-only run: answer it now."""
+        """A retrieved row from an earlier retrieval-only run: answer it from
+        the SAVED context (the evidence the run recorded), not a rebuild."""
         qid = q["question_id"]
         async with sem:
             t0 = time.time()
             prev = by_id[qid]
-            ctx = context_for(qid, prev["retrieved_doc_ids"], [])
+            note = None
+            if published:
+                ctx = context_for(qid, prev["retrieved_doc_ids"], [])
+            else:
+                saved = saved_context(run_dir, qid, prev.get("context_sha256"))
+                if saved is not None:
+                    ctx = {k: saved[k] for k in validate.CONTEXT_ROW_KEYS if k != "question_id"}
+                else:
+                    ctx = hydrate.build_context(prev["retrieved_doc_ids"], [], store, g.docs_in_context, g.max_context_chars)
+                    note = "saved context not found; rebuilt from the retrieval order"
+            async with lock:
+                record_attempt(qid, ctx, prev["retrieved_doc_ids"])
             a, stages, err = await answer(q, ctx)
             row = {**prev, "answer": a, "stages": stages, "secs": round(time.time() - t0, 1),
                    "context_docs": ctx["context_docs"], "context_chars": ctx["context_chars"],
@@ -268,7 +361,9 @@ async def run_generate(cfg: RunConfig, run_dir: Path, questions: list[dict], *, 
             row.pop("error", None)
             if err:
                 row["error"] = err
-            await commit(qid, row, None, q)
+            if note:
+                row["note"] = note
+            await commit(qid, row, q)
 
     async def one(client: HydraDBQueryClient | None, q: dict):
         qid = q["question_id"]
@@ -284,10 +379,12 @@ async def run_generate(cfg: RunConfig, run_dir: Path, questions: list[dict], *, 
                     row = {"question_id": qid, "stage": "error", "error": f"query: {str(exc)[:150]}", "answer": "",
                            "document_ids": [], "retrieved_doc_ids": [], "context_docs": [], "context_chars": 0,
                            "secs": round(time.time() - t0, 1)}
-                    await commit(qid, row, None, q)
+                    await commit(qid, row, q)
                     return
                 doc_ids = hydrate.distinct_docs(chunks)
             ctx = context_for(qid, doc_ids, chunks)
+            async with lock:
+                record_attempt(qid, ctx, doc_ids[:50])
             a, stages, err = "", {}, None
             if not retrieval_only:
                 if not doc_ids:
@@ -304,10 +401,8 @@ async def run_generate(cfg: RunConfig, run_dir: Path, questions: list[dict], *, 
             }
             if err:
                 row["error"] = err
-            await commit(qid, row, ctx, q)
+            await commit(qid, row, q)
 
-    if published or retrieval_only is False and not to_query and to_finish:
-        pass
     if to_query and not published:
         if not api_key:
             raise RuntimeError("HYDRADB_API_KEY is required unless --from-contexts is used")
@@ -326,12 +421,13 @@ async def run_generate(cfg: RunConfig, run_dir: Path, questions: list[dict], *, 
     missing = [q for q in requested_ids if q not in by_id or by_id[q]["stage"] not in ("answered", want)]
     complete = not missing and not errors
     n = write_answers([x for x in final if x["stage"] != "error"], run_dir / "answers.jsonl")
-    manifest.write_manifest(run_dir, "generate", cfg.to_dict(), [run_dir / "answers.jsonl", ckpt, ctx_path],
+    ctx_out = materialise_contexts(run_dir, final)
+    manifest.write_manifest(run_dir, "generate", cfg.to_dict(), [run_dir / "answers.jsonl", ckpt, ctx_out],
                             extra={"requested": total, "written": n, "errors": len(errors), "missing": len(missing),
                                    "complete": complete, "retrieval_only": retrieval_only,
                                    "from_contexts": str(from_contexts) if from_contexts else None,
-                                   "document_store": store.identity if store else None, "identity": identity,
-                                   "resume_notes": notes})
+                                   "document_store": store_identity, "identity": identity, "resume_notes": notes,
+                                   "attempts_recorded": attempt_no["n"]})
     print(f"\nWrote {n} rows -> {run_dir / 'answers.jsonl'}  requested={total} errors={len(errors)} "
           f"missing={len(missing)} complete={complete}")
     return final, (None if complete else IncompleteRun(missing, errors))

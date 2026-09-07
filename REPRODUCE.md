@@ -167,11 +167,16 @@ cp config/my-run.example.yaml config/my-run.yaml     # edit hydradb.database / c
 
 The command converts documents one at a time, journals every batch before it is
 sent, waits for HydraDB's indexing status per batch, and writes
-`ingest_manifest.json` with sent / settled / errored / pending counts and a
-`ready` flag that is true only when every sent item has a terminal status. It
-exits 2 if anything is outstanding; `--resume` reconciles outstanding items
+`ingest_manifest.json` with sent / settled / errored / pending counts, the list
+of failed item ids, and two flags: `resolved` (every sent item has a terminal
+status) and `ready` (every sent item settled successfully, nothing failed).
+It exits 2 unless `ready` is true. `--resume` reconciles outstanding items
 (re-sends a batch that was interrupted before acknowledgement; ids are
-deterministic and ingestion is upsert, so this is safe) before continuing. Query
+deterministic and ingestion is upsert, so this is safe); `--resume
+--retry-failed` re-sends exactly the items HydraDB reported as failed;
+`--accept-failures` ends with exit 0 while recording the failed ids and leaving
+`ready` false, for a deliberately incomplete corpus. A resume is refused if the
+corpus revision, the converter, the source scope or the target changed. Query
 only when `ready` is true. Then level 3 against the new collection with the same
 config file.
 
@@ -192,8 +197,11 @@ config file.
 | `PROBLEMS FOUND` from `verify` | an artifact is inconsistent | the report names the check and the ids |
 
 Where things are: every run directory has `manifest.json` (one record per
-stage, with hashes of what it wrote), `SHA256SUMS`, and for judging
-`protocol_shards/log_*.attempt*.txt`. To report a problem, attach the manifest
+stage, with hashes of what it wrote at that time), `SHA256SUMS`,
+`contexts.attempts.jsonl` (every context ever sent to the model, in order) next
+to the authoritative `contexts.jsonl.gz`, and for judging
+`protocol_shards/log_*.attempt*.txt` plus `shards.json` (the plan and its
+fingerprint). To report a problem, attach the manifest
 and the output of `verify --run-dir <dir> --minimal`.
 
 ## What can and cannot vary

@@ -34,13 +34,21 @@ class FakeAdminClient:
       in ``aborted`` and then raises (the request "never reached the server");
     * ``fail_wait_on_call``: the N-th ``wait_processing`` call raises before
       returning anything (the process dies mid-poll);
-    * ``pending_ids``: ids reported as never settling (status-poll timeout).
+    * ``pending_ids``: ids reported as never settling (status-poll timeout);
+    * ``errored_ids``: ids reported ``errored`` every time they are polled;
+    * ``flaky_ids``: ids reported ``errored`` the first time they are polled
+      and ``completed`` afterwards (a retry succeeds);
+    * ``error_all``: every id errors (the reviewer's all-failed batch).
     """
 
     instances: list["FakeAdminClient"] = []
     fail_send_on_call: int | None = None
     fail_wait_on_call: int | None = None
     pending_ids: set[str] = set()
+    errored_ids: set[str] = set()
+    flaky_ids: set[str] = set()
+    error_all: bool = False
+    polled: list[str] = []  # every id ever polled, across instances
 
     def __init__(self, api_key: str, base_url: str = "", **kw):
         assert api_key
@@ -75,9 +83,18 @@ class FakeAdminClient:
         if FakeAdminClient.fail_wait_on_call == len(self.waited) + 1:
             raise ConnectionError("simulated crash while polling status")
         self.waited.append(list(source_ids))
-        # the first id of every poll "fails", the rest complete, unless told to stay pending
-        return {i: ("pending" if i in FakeAdminClient.pending_ids else "errored" if n == 0 else "completed")
-                for n, i in enumerate(source_ids)}
+        out = {}
+        for i in source_ids:
+            if i in FakeAdminClient.pending_ids:
+                out[i] = "pending"
+            elif FakeAdminClient.error_all or i in FakeAdminClient.errored_ids:
+                out[i] = "errored"
+            elif i in FakeAdminClient.flaky_ids and i not in FakeAdminClient.polled:
+                out[i] = "errored"
+            else:
+                out[i] = "completed"
+        FakeAdminClient.polled.extend(source_ids)
+        return out
 
     def close(self):
         pass
@@ -117,6 +134,10 @@ def fake_client(monkeypatch):
     FakeAdminClient.fail_send_on_call = None
     FakeAdminClient.fail_wait_on_call = None
     FakeAdminClient.pending_ids = set()
+    FakeAdminClient.errored_ids = set()
+    FakeAdminClient.flaky_ids = set()
+    FakeAdminClient.error_all = False
+    FakeAdminClient.polled = []
     monkeypatch.setattr(ingest, "HydraDBAdminClient", FakeAdminClient)
     return FakeAdminClient
 
@@ -130,18 +151,32 @@ def _waited_ids(clients) -> list[str]:
 
 
 def _status_log(run_dir: Path) -> list[dict]:
+    """The raw log lines (``ingest.read_status_log`` is the deduplicating reader)."""
     return [json.loads(line) for line in (run_dir / "ingest_status.jsonl").read_text().splitlines()]
+
+
+def _small_corpus(path: Path, docs: list[tuple[str, str]], revision: str = "a") -> Path:
+    """A ``documents.sqlite`` of one-item ``google_drive`` docs (item id == doc id) with meta identity."""
+    corpus.build_documents_db(path, [(d, "google_drive", f"Title {d}", body, len(body)) for d, body in docs],
+                              quiet=True, identity={"source": "repo", "revision": revision})
+    return path
+
+
+def _readiness(sent, settled, errored, pending, unresolved) -> dict:
+    resolved = sent == settled + errored and pending == 0 and unresolved == 0
+    return {"items_sent": sent, "items_settled": settled, "items_errored": errored, "items_pending": pending,
+            "unresolved_batches": unresolved, "resolved": resolved,
+            "ready": resolved and errored == 0 and sent == settled}
 
 
 def _assert_converged(rec: dict, run_dir: Path, state_path: Path, db_path: Path, clients, expected_items,
                       expected_batches):
-    """The accounting a run must show once every item is sent and resolved, however it got there."""
+    """The accounting a run must show once every item is sent and settled, however it got there."""
     n = len(expected_items)
-    assert rec["ready"] is True
-    assert rec["readiness"] == {"items_sent": n, "items_settled": n - expected_batches,
-                                "items_errored": expected_batches, "items_pending": 0,
-                                "unresolved_batches": 0, "ready": True}
-    assert rec["statuses"] == {"settled": n - expected_batches, "errored": expected_batches, "pending": 0}
+    assert rec["ready"] is True and rec["resolved"] is True
+    assert rec["readiness"] == _readiness(n, n, 0, 0, 0)
+    assert rec["statuses"] == {"settled": n, "errored": 0, "pending": 0}
+    assert rec["failed_ids"] == {} and rec["accepted_failures"] == []
     assert rec["items"]["sent"] == n and rec["batches"]["sent"] == expected_batches
     # no document skipped, no item sent twice
     assert sorted(_sent_ids(clients)) == sorted(it["id"] for it in expected_items)
@@ -149,9 +184,11 @@ def _assert_converged(rec: dict, run_dir: Path, state_path: Path, db_path: Path,
     assert sorted(_waited_ids(clients)) == sorted(it["id"] for it in expected_items)
     log = _status_log(run_dir)
     assert len(log) == n and len({r["id"] for r in log}) == n
-    assert all(r["status"] in ("completed", "errored") for r in log)
+    assert all(r["status"] == "completed" and r["attempt"] == 1 for r in log)
+    assert ingest.read_status_log(run_dir / "ingest_status.jsonl") == log
     state = json.loads(state_path.read_text())
     assert state["items_sent"] == n and state["batches_sent"] == expected_batches
+    assert state["failed_ids"] == {}
     assert [e["state"] for e in state["journal"]] == ["settled"] * expected_batches
     assert all("ids" not in e for e in state["journal"])  # settled entries are compacted
     assert sum(e["counts"]["settled"] + e["counts"]["errored"] for e in state["journal"]) == n
@@ -179,7 +216,7 @@ def test_dry_run_counts_match_convert_and_makes_no_http_calls(tmp_path, cfg, db_
     assert rec["corpus"]["documents_read"] == 5
     assert rec["items"]["sent"] == 0 and rec["batches"]["sent"] == 0
     assert rec["batches"]["would_send"] >= 1
-    assert rec["ready"] is False and rec["readiness"]["items_sent"] == 0  # nothing sent: not ready
+    assert rec["ready"] is False and rec["resolved"] is False and rec["readiness"]["items_sent"] == 0  # nothing sent
 
     on_disk = json.loads((run_dir / "ingest_manifest.json").read_text())
     assert on_disk["items"] == rec["items"]
@@ -215,6 +252,7 @@ def test_full_run_batches_journals_waits_and_is_ready(tmp_path, cfg, db_path, ex
     assert state["infer"] is True
     assert state["source_types"] is None and state["limit"] is None
     assert state["corpus"]["documents"] == 5 and len(state["corpus"]["doc_ids_sha256"]) == 64
+    assert state["corpus"]["source"] == "repo" and state["converter"]["sha256"] == ingest.converter_sha256()
     # the journal records each batch's doc range; ranges tile the corpus in cursor order
     ranges = [(e["docs"]["after"], e["docs"]["last"]) for e in state["journal"]]
     assert ranges[0][0] is None
@@ -239,10 +277,10 @@ def test_no_wait_is_not_ready_until_resumed(tmp_path, cfg, db_path, expected_ite
     assert not (run_dir / "ingest_status.jsonl").exists()
     exc = exc_info.value
     n, batches = len(expected_items), len(client.ingested)
-    assert exc.readiness == {"items_sent": n, "items_settled": 0, "items_errored": 0, "items_pending": n,
-                             "unresolved_batches": batches, "ready": False}
+    assert exc.readiness == _readiness(n, 0, 0, n, batches)
     assert (exc.items_sent, exc.items_pending, exc.unresolved_batches) == (n, n, batches)
-    assert "pending" in str(exc) and "--resume" in str(exc)
+    assert exc.ready is False and exc.resolved is False and exc.reason == "unresolved"
+    assert "pending" in str(exc) and "--resume" in str(exc) and "--retry-failed" not in str(exc)
     on_disk = json.loads((run_dir / "ingest_manifest.json").read_text())
     assert on_disk["ready"] is False and on_disk["readiness"] == exc.readiness == exc.manifest["readiness"]
     assert on_disk["statuses"] == {"settled": 0, "errored": 0, "pending": n}
@@ -366,11 +404,10 @@ def test_run_ending_with_pending_ids_raises_incomplete_and_resume_finishes_it(tm
     batches = len(first.ingested)
     exc = exc_info.value
     n = len(expected_items)
-    assert exc.readiness == {"items_sent": n, "items_settled": n - batches - 3, "items_errored": batches,
-                             "items_pending": 3, "unresolved_batches": 1, "ready": False}
+    assert exc.readiness == _readiness(n, n - 3, 0, 3, 1)
     on_disk = json.loads((run_dir / "ingest_manifest.json").read_text())
     assert on_disk["ready"] is False and on_disk["readiness"] == exc.readiness
-    assert on_disk["batches"] == {"sent": batches, "unresolved": 1}
+    assert on_disk["batches"] == {"sent": batches, "retried": 0, "unresolved": 1}
     assert {r["id"] for r in _status_log(run_dir)}.isdisjoint(stuck)  # pending ids are not logged yet
     state = json.loads(state_path.read_text())
     [open_entry] = [e for e in state["journal"] if e["state"] == "sent"]
@@ -382,13 +419,13 @@ def test_run_ending_with_pending_ids_raises_incomplete_and_resume_finishes_it(tm
     resumed = fake_client.instances[-1]
     assert resumed.ingested == []
     assert [set(ids) for ids in resumed.waited] == [stuck]  # only the pending ids are re-polled
-    # the re-poll's first id "errors" in the fake, so one more errored than the reference accounting
-    assert rec["ready"] is True
-    assert rec["readiness"]["items_pending"] == 0 and rec["readiness"]["unresolved_batches"] == 0
-    assert rec["readiness"]["items_settled"] + rec["readiness"]["items_errored"] == n == rec["readiness"]["items_sent"]
     assert sorted(_waited_ids([first, resumed])) == sorted([it["id"] for it in expected_items] + sorted(stuck))
+    assert rec["ready"] is True and rec["resolved"] is True
+    assert rec["readiness"] == _readiness(n, n, 0, 0, 0) and rec["failed_ids"] == {}
+    assert rec["batches"] == {"sent": batches, "retried": 0, "unresolved": 0}
     log = _status_log(run_dir)
-    assert len(log) == n and len({r["id"] for r in log}) == n
+    assert len(log) == n and len({r["id"] for r in log}) == n  # the stuck ids were logged once, on resume
+    assert ingest.read_status_log(run_dir / "ingest_status.jsonl") == log
 
 
 # ---------------------------------------------------------------------------
@@ -441,10 +478,10 @@ def test_resume_refuses_a_different_source_scope_or_corpus(tmp_path, cfg, db_pat
     ingest.run_ingest(cfg, db_path, state_path, source_types=["slack", "gmail"], batch_sleep=0, api_key="k",
                       provision=False)
     assert json.loads(state_path.read_text())["source_types"] == ["gmail", "slack"]
-    with pytest.raises(RuntimeError, match="refusing to resume.*source_types/limit"):
+    with pytest.raises(RuntimeError, match="refusing to resume.*source_types="):
         ingest.run_ingest(cfg, db_path, state_path, resume=True, source_types=["slack"], api_key="k",
                           provision=False)
-    with pytest.raises(RuntimeError, match="refusing to resume.*source_types/limit"):
+    with pytest.raises(RuntimeError, match="refusing to resume.*limit="):
         ingest.run_ingest(cfg, db_path, state_path, resume=True, source_types=["slack", "gmail"], limit=3,
                           api_key="k", provision=False)
     # same scope in a different order is the same scope
@@ -454,8 +491,15 @@ def test_resume_refuses_a_different_source_scope_or_corpus(tmp_path, cfg, db_pat
     # a different corpus (here: a subset build) is refused too
     other_db = tmp_path / "other.sqlite"
     corpus.build_from_repo(ERB_REPO, other_db, limit=3, quiet=True)
-    with pytest.raises(RuntimeError, match="refusing to resume.*corpus"):
+    with pytest.raises(RuntimeError, match="refusing to resume.*corpus.documents="):
         ingest.run_ingest(cfg, other_db, state_path, resume=True, source_types=["slack", "gmail"],
+                          api_key="k", provision=False)
+    # ... and so is a checkpoint written by a different converter
+    state = json.loads(state_path.read_text())
+    state["converter"]["sha256"] = "0" * 64
+    state_path.write_text(json.dumps(state))
+    with pytest.raises(RuntimeError, match="refusing to resume.*converter.sha256="):
+        ingest.run_ingest(cfg, db_path, state_path, resume=True, source_types=["slack", "gmail"],
                           api_key="k", provision=False)
 
     # a pre-journal checkpoint cannot be reconciled
@@ -471,3 +515,276 @@ def test_missing_api_key_is_a_clear_error(tmp_path, cfg, db_path, fake_client, m
     monkeypatch.setattr(ingest, "load_dotenv", lambda *a, **kw: False)  # ignore any developer .env
     with pytest.raises(RuntimeError, match="HYDRADB_API_KEY"):
         ingest.run_ingest(cfg, db_path, tmp_path / "s.json", provision=False)
+
+
+# ---------------------------------------------------------------------------
+# failed items (reviewer finding P1-1): resolved is not ready
+# ---------------------------------------------------------------------------
+def _run(cfg, db, state_path, **kw):
+    kw.setdefault("batch_sleep", 0)
+    kw.setdefault("provision", False)
+    kw.setdefault("api_key", "k")
+    return ingest.run_ingest(cfg, db, state_path, **kw)
+
+
+def test_reviewer_fixture_all_errored_batch_is_resolved_but_not_ready(tmp_path, cfg, fake_client):
+    """The reviewer's P1-1 fixture: one doc, its only item errors. Was: ready=True and a normal return."""
+    db = _small_corpus(tmp_path / "docs.sqlite", [("d1", "ORIGINAL BODY")], revision="revision-A")
+    run_dir = tmp_path / "all-errored"
+    state_path = run_dir / "ingest_state.json"
+    fake_client.error_all = True
+    with pytest.raises(ingest.IngestIncomplete) as exc_info:
+        _run(cfg, db, state_path)
+    exc = exc_info.value
+    assert exc.readiness == _readiness(1, 0, 1, 0, 0)
+    assert exc.ready is False and exc.resolved is True and exc.reason == "failed"
+    assert exc.failed_ids == {"d1": {"batch": 1, "status": "errored", "attempts": 1}}
+    assert "1 item(s) failed" in str(exc) and "--retry-failed" in str(exc)
+    on_disk = json.loads((run_dir / "ingest_manifest.json").read_text())
+    assert on_disk["ready"] is False and on_disk["resolved"] is True
+    assert on_disk["failed_ids"] == exc.failed_ids and on_disk["accepted_failures"] == []
+    state = json.loads(state_path.read_text())
+    assert state["journal"][0]["state"] == "settled" and state["journal"][0]["counts"] == {"settled": 0, "errored": 1}
+    assert state["failed_ids"] == exc.failed_ids  # compaction keeps the failed-id record
+    assert _status_log(run_dir) == [{"batch": 1, "id": "d1", "status": "errored", "attempt": 1}]
+    stages = json.loads((run_dir / "manifest.json").read_text())["stages"]
+    assert stages[-1]["ingest"]["ready"] is False and stages[-1]["ingest"]["resolved"] is True
+
+
+def test_all_failed_batch_on_the_repo_corpus_raises_incomplete(tmp_path, cfg, db_path, expected_items, fake_client):
+    state_path = tmp_path / "run" / "s.json"
+    fake_client.error_all = True
+    with pytest.raises(ingest.IngestIncomplete) as exc_info:
+        _run(cfg, db_path, state_path, batch_size=10)
+    exc = exc_info.value
+    n = len(expected_items)
+    assert exc.readiness == _readiness(n, 0, n, 0, 0)
+    assert exc.ready is False and exc.resolved is True
+    assert set(exc.failed_ids) == {it["id"] for it in expected_items}
+    assert all(v["status"] == "errored" and v["attempts"] == 1 for v in exc.failed_ids.values())
+    # a plain --resume finds nothing unresolved, sends nothing, and is still not ready
+    with pytest.raises(ingest.IngestIncomplete) as again:
+        _run(cfg, db_path, state_path, resume=True, batch_size=10)
+    assert fake_client.instances[-1].ingested == [] and fake_client.instances[-1].waited == []
+    assert again.value.readiness == exc.readiness and again.value.reason == "failed"
+
+
+def test_mixed_batch_counts_are_exact(tmp_path, cfg, fake_client):
+    db = _small_corpus(tmp_path / "docs.sqlite", [("d1", "one"), ("d2", "two"), ("d3", "three")])
+    run_dir = tmp_path / "run"
+    state_path = run_dir / "s.json"
+    fake_client.errored_ids = {"d2"}
+    with pytest.raises(ingest.IngestIncomplete) as exc_info:
+        _run(cfg, db, state_path, batch_size=10)
+    exc = exc_info.value
+    assert exc.readiness == _readiness(3, 2, 1, 0, 0)
+    assert (exc.items_sent, exc.items_settled, exc.items_errored, exc.items_pending) == (3, 2, 1, 0)
+    assert exc.manifest["statuses"] == {"settled": 2, "errored": 1, "pending": 0}
+    assert exc.failed_ids == {"d2": {"batch": 1, "status": "errored", "attempts": 1}}
+    assert exc.manifest["batches"] == {"sent": 1, "retried": 0, "unresolved": 0}
+    assert "1 item(s) failed" in str(exc) and "--retry-failed" in str(exc)
+    [client] = fake_client.instances
+    assert [it["id"] for b in client.ingested for it in b] == ["d1", "d2", "d3"]
+    assert sorted(_status_log(run_dir), key=lambda r: r["id"]) == [
+        {"batch": 1, "id": "d1", "status": "completed", "attempt": 1},
+        {"batch": 1, "id": "d2", "status": "errored", "attempt": 1},
+        {"batch": 1, "id": "d3", "status": "completed", "attempt": 1}]
+
+
+def test_retry_failed_resends_exactly_the_failed_items_and_becomes_ready(tmp_path, cfg, db_path, expected_items,
+                                                                          fake_client):
+    run_dir = tmp_path / "run"
+    state_path = run_dir / "s.json"
+    # every item of the slack thread plus one comment of the jira ticket fail on their first attempt
+    slack = [it["id"] for it in expected_items if it["id"].split("_m")[0] != it["id"]]
+    jira_comment = next(it["id"] for it in expected_items if "_c0" in it["id"])
+    flaky = set(slack) | {jira_comment}
+    assert len(flaky) >= 3
+    fake_client.flaky_ids = set(flaky)
+    with pytest.raises(ingest.IngestIncomplete) as exc_info:
+        _run(cfg, db_path, state_path, batch_size=10)
+    first = fake_client.instances[-1]
+    n, batches = len(expected_items), len(first.ingested)
+    assert set(exc_info.value.failed_ids) == flaky
+    assert exc_info.value.readiness == _readiness(n, n - len(flaky), len(flaky), 0, 0)
+
+    rec = _run(cfg, db_path, state_path, resume=True, retry_failed=True, batch_size=10)
+    retried = fake_client.instances[-1]
+    # exactly the failed items were re-sent (none of their siblings that had settled), each once
+    assert sorted(it["id"] for b in retried.ingested for it in b) == sorted(flaky)
+    assert sorted(_waited_ids([retried])) == sorted(flaky)
+    assert all(it in expected_items for b in retried.ingested for it in b)  # item for item what convert produces
+    # ... and the accounting converged without double counting
+    assert rec["ready"] is True and rec["resolved"] is True
+    assert rec["readiness"] == _readiness(n, n, 0, 0, 0)
+    assert rec["failed_ids"] == {} and rec["accepted_failures"] == []
+    assert rec["items"]["sent"] == n
+    assert rec["batches"]["retried"] == len(retried.ingested) >= 1
+    assert rec["batches"]["sent"] == batches + rec["batches"]["retried"]
+    assert rec["retry"] == {"batches": rec["batches"]["retried"], "items": len(flaky), "recovered": len(flaky)}
+    assert rec["corpus"]["documents_read"] == 0
+    state = json.loads(state_path.read_text())
+    assert state["failed_ids"] == {} and state["last_doc_id"] == max(d["doc_id"] for d in corpus.iter_documents(db_path))
+    retry_entries = [e for e in state["journal"] if e.get("retry")]
+    assert len(retry_entries) == rec["batches"]["retried"]
+    assert all(e["state"] == "settled" and e["counts"]["errored"] == 0 and "doc_ids" in e for e in retry_entries)
+    assert sum(e["n_items"] for e in retry_entries) == len(flaky)
+    # the status log is the attempt history: one row per attempt, both attempts of every flaky id present
+    log = ingest.read_status_log(run_dir / "ingest_status.jsonl")
+    assert len(log) == n + len(flaky) == len(_status_log(run_dir))
+    by_id = {}
+    for r in log:
+        by_id.setdefault(r["id"], []).append((r["attempt"], r["status"]))
+    assert all(by_id[i] == [(1, "errored"), (2, "completed")] for i in flaky)
+    assert all(by_id[i] == [(1, "completed")] for i in by_id if i not in flaky)
+
+
+def test_retry_failed_keeps_ids_that_fail_again_with_attempts_bumped(tmp_path, cfg, fake_client):
+    db = _small_corpus(tmp_path / "docs.sqlite", [("d1", "one"), ("d2", "two"), ("d3", "three")])
+    state_path = tmp_path / "run" / "s.json"
+    fake_client.errored_ids = {"d2"}
+    fake_client.flaky_ids = {"d3"}
+    with pytest.raises(ingest.IngestIncomplete) as first:
+        _run(cfg, db, state_path, batch_size=10)
+    assert first.value.readiness == _readiness(3, 1, 2, 0, 0)
+    # retry in the same run as the first attempt also works (no resume needed for this run's own failures)
+    with pytest.raises(ingest.IngestIncomplete) as second:
+        _run(cfg, db, state_path, resume=True, retry_failed=True, batch_size=10)
+    exc = second.value
+    assert [it["id"] for b in fake_client.instances[-1].ingested for it in b] == ["d2", "d3"]
+    assert exc.readiness == _readiness(3, 2, 1, 0, 0)
+    assert exc.failed_ids == {"d2": {"batch": 2, "status": "errored", "attempts": 2}}
+    assert exc.manifest["retry"] == {"batches": 1, "items": 2, "recovered": 1}
+    assert "1 item(s) failed" in str(exc)
+    # a further retry re-sends only d2 again; attempts keep counting
+    with pytest.raises(ingest.IngestIncomplete) as third:
+        _run(cfg, db, state_path, resume=True, retry_failed=True, batch_size=10)
+    assert [it["id"] for b in fake_client.instances[-1].ingested for it in b] == ["d2"]
+    assert third.value.failed_ids == {"d2": {"batch": 3, "status": "errored", "attempts": 3}}
+    assert third.value.readiness == _readiness(3, 2, 1, 0, 0)
+    assert [r["attempt"] for r in ingest.read_status_log(tmp_path / "run" / "ingest_status.jsonl") if r["id"] == "d2"] == [1, 2, 3]
+
+
+def test_retry_failed_from_scratch_retries_this_runs_failures_once(tmp_path, cfg, fake_client):
+    db = _small_corpus(tmp_path / "docs.sqlite", [("d1", "one"), ("d2", "two")])
+    state_path = tmp_path / "run" / "s.json"
+    fake_client.flaky_ids = {"d2"}
+    rec = _run(cfg, db, state_path, retry_failed=True, batch_size=10)
+    [client] = fake_client.instances
+    assert [[it["id"] for it in b] for b in client.ingested] == [["d1", "d2"], ["d2"]]
+    assert rec["ready"] is True and rec["readiness"] == _readiness(2, 2, 0, 0, 0)
+    assert rec["retry"] == {"batches": 1, "items": 1, "recovered": 1}
+
+
+def test_accept_failures_returns_normally_with_ready_false_recorded(tmp_path, cfg, fake_client):
+    db = _small_corpus(tmp_path / "docs.sqlite", [("d1", "one"), ("d2", "two"), ("d3", "three")])
+    run_dir = tmp_path / "run"
+    state_path = run_dir / "s.json"
+    fake_client.errored_ids = {"d3"}
+    rec = _run(cfg, db, state_path, accept_failures=True, batch_size=10)
+    assert rec["ready"] is False and rec["resolved"] is True
+    assert rec["readiness"] == _readiness(3, 2, 1, 0, 0)
+    assert rec["accept_failures"] is True and rec["accepted_failures"] == ["d3"]
+    assert rec["failed_ids"] == {"d3": {"batch": 1, "status": "errored", "attempts": 1}}
+    on_disk = json.loads((run_dir / "ingest_manifest.json").read_text())
+    assert on_disk["ready"] is False and on_disk["accepted_failures"] == ["d3"]
+    stages = json.loads((run_dir / "manifest.json").read_text())["stages"]
+    assert stages[-1]["ingest"]["ready"] is False and stages[-1]["ingest"]["accepted_failures"] == ["d3"]
+
+    # accept_failures never covers unresolved work
+    fake_client.pending_ids = {"d1"}
+    with pytest.raises(ingest.IngestIncomplete) as exc_info:
+        _run(cfg, db, tmp_path / "run2" / "s.json", accept_failures=True, batch_size=10)
+    assert exc_info.value.reason == "unresolved" and exc_info.value.manifest["accepted_failures"] == []
+
+
+# ---------------------------------------------------------------------------
+# resume identity (reviewer finding H1): same ids, different content
+# ---------------------------------------------------------------------------
+def test_resume_refuses_a_corpus_with_the_same_ids_but_another_revision(tmp_path, cfg, fake_client):
+    original = _small_corpus(tmp_path / "docs.sqlite", [("d1", "ORIGINAL BODY")], revision="a")
+    alternate = _small_corpus(tmp_path / "alternate.sqlite", [("d1", "DIFFERENT BODY")], revision="b")
+    assert ingest.corpus_identity(original)["doc_ids_sha256"] == ingest.corpus_identity(alternate)["doc_ids_sha256"]
+    run_dir = tmp_path / "corpus-swap"
+    state_path = run_dir / "ingest_state.json"
+    fake_client.fail_send_on_call = 1
+    with pytest.raises(ConnectionError):
+        _run(cfg, original, state_path)
+    assert json.loads(state_path.read_text())["journal"][0]["state"] == "sending"
+
+    fake_client.fail_send_on_call = None
+    with pytest.raises(RuntimeError, match="refusing to resume.*corpus.revision='a'.*corpus.revision='b'"):
+        _run(cfg, alternate, state_path, resume=True)
+    assert fake_client.instances[-1].ingested == []  # the replacement body was never sent
+    assert not (run_dir / "ingest_manifest.json").exists()
+
+    # the original corpus resumes fine and sends the original body
+    rec = _run(cfg, original, state_path, resume=True)
+    [[item]] = fake_client.instances[-1].ingested
+    assert "ORIGINAL BODY" in json.dumps(item) and rec["ready"] is True
+    assert rec["corpus"]["source"] == "repo" and rec["corpus"]["revision"] == "a"
+    assert rec["converter"]["sha256"] == ingest.converter_sha256()
+
+
+# ---------------------------------------------------------------------------
+# status log (reviewer finding H9): crash between the log append and the checkpoint
+# ---------------------------------------------------------------------------
+def test_crash_after_status_append_before_checkpoint_leaves_one_row_per_batch_and_id(tmp_path, cfg, fake_client,
+                                                                                     monkeypatch):
+    db = _small_corpus(tmp_path / "docs.sqlite", [("d1", "one")])
+    run_dir = tmp_path / "status-journal-crash"
+    state_path = run_dir / "ingest_state.json"
+    log_path = run_dir / "ingest_status.jsonl"
+    original_write = ingest._atomic_write_json
+
+    def crash_write(path, payload):
+        if any(e["state"] == "settled" for e in payload["journal"]):
+            raise OSError("crash after status log append before checkpoint")
+        return original_write(path, payload)
+
+    monkeypatch.setattr(ingest, "_atomic_write_json", crash_write)
+    with pytest.raises(OSError):
+        _run(cfg, db, state_path)
+    assert _status_log(run_dir) == [{"batch": 1, "id": "d1", "status": "completed", "attempt": 1}]
+    state = json.loads(state_path.read_text())
+    assert state["journal"][0]["state"] == "sent" and state["journal"][0]["statuses"] == {}
+
+    monkeypatch.setattr(ingest, "_atomic_write_json", original_write)
+    rec = _run(cfg, db, state_path, resume=True)
+    resumed = fake_client.instances[-1]
+    assert resumed.ingested == [] and resumed.waited == []  # the logged status was adopted, not re-polled
+    assert rec["ready"] is True and rec["readiness"] == _readiness(1, 1, 0, 0, 0)
+    assert _status_log(run_dir) == [{"batch": 1, "id": "d1", "status": "completed", "attempt": 1}]
+    assert ingest.read_status_log(log_path) == _status_log(run_dir)
+
+    # even a log that did end up with a duplicate reads as one row per (batch, id), the last one winning
+    with open(log_path, "a") as f:
+        f.write(json.dumps({"batch": 1, "id": "d1", "status": "errored", "attempt": 1}) + "\n")
+        f.write(json.dumps({"batch": 2, "id": "d1", "status": "completed", "attempt": 2}) + "\n")
+    assert len(_status_log(run_dir)) == 3
+    assert ingest.read_status_log(log_path) == [{"batch": 1, "id": "d1", "status": "errored", "attempt": 1},
+                                                {"batch": 2, "id": "d1", "status": "completed", "attempt": 2}]
+
+
+def test_crash_after_status_append_with_a_failed_id_keeps_it_failed_on_resume(tmp_path, cfg, fake_client, monkeypatch):
+    db = _small_corpus(tmp_path / "docs.sqlite", [("d1", "one"), ("d2", "two")])
+    run_dir = tmp_path / "run"
+    state_path = run_dir / "s.json"
+    fake_client.errored_ids = {"d2"}
+    original_write = ingest._atomic_write_json
+
+    def crash_write(path, payload):
+        if any(e["state"] == "settled" for e in payload["journal"]):
+            raise OSError("crash")
+        return original_write(path, payload)
+
+    monkeypatch.setattr(ingest, "_atomic_write_json", crash_write)
+    with pytest.raises(OSError):
+        _run(cfg, db, state_path)
+    monkeypatch.setattr(ingest, "_atomic_write_json", original_write)
+    with pytest.raises(ingest.IngestIncomplete) as exc_info:
+        _run(cfg, db, state_path, resume=True)
+    assert fake_client.instances[-1].waited == []
+    assert exc_info.value.readiness == _readiness(2, 1, 1, 0, 0)
+    assert exc_info.value.failed_ids == {"d2": {"batch": 1, "status": "errored", "attempts": 1}}
+    assert len(ingest.read_status_log(run_dir / "ingest_status.jsonl")) == 2 == len(_status_log(run_dir))

@@ -4,6 +4,7 @@ version = "1.0.0"
 description = "Reproducible harness for HydraDB on EnterpriseRAG-Bench: ingest, retrieve, generate, judge, compare."
 readme = "README.md"
 license = { text = "MIT" }
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.11,<3.13"
 authors = [{ name = "HydraDB" }]
 dependencies = [

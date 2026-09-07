@@ -217,11 +217,16 @@ checkable:
 
 For runs made with this package, every stage appends to `manifest.json` in the
 run directory (package version, repository commit, Python version, the full
-config, the pinned upstream identifiers, sha256 of every file it produced), and
-`SHA256SUMS` covers the directory. The generation checkpoint carries a
-configuration fingerprint and refuses to resume under a different one. The
-published run's manifest was written when the artifacts were assembled and says
-so in its `stage` field.
+config, the pinned and the actual upstream identifiers, sha256 of every file it
+produced as of that stage; the file on disk must match the latest record that
+names it), and `SHA256SUMS` covers the directory. Generation keeps an
+append-only attempt history (`contexts.attempts.jsonl`, written before the
+checkpoint row that depends on it) and materialises `contexts.jsonl.gz` with
+exactly one authoritative context per completed question at the end of every
+run. The checkpoint carries a run identity (configuration fingerprint, prompts,
+endpoint, questions file hash, contexts file hash for replay, document-store
+identity) and refuses to resume under a different one. The published run's
+manifest records are marked `retrospective`.
 
 ### Run history
 
@@ -265,8 +270,11 @@ benchmark-internal annotation fields.
 - It does not tune anything per question or per category.
 - It does not consult gold document ids or gold answers at any point before
   scoring; hydration resolves only the ids HydraDB returned.
-- It does not redistribute the corpus; `download` rebuilds `documents.sqlite`
-  from the benchmark's own release.
+- It does not redistribute the full corpus; `download` rebuilds `documents.sqlite`
+  from the benchmark's own release. It does redistribute a subset (the canonical
+  text of the 2,667 documents in the published contexts, the questions, five
+  sample documents, and the gold data of 14 corrected questions); see
+  `THIRD_PARTY_NOTICES.md`.
 - It does not attribute the score to ingestion-time inference, to the reranking
   mode, or to hydration individually. The pilot ablation that led to this
   configuration (chunks/fast 58.66 → full documents/fast 80.0 → full

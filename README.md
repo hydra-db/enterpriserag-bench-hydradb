@@ -32,7 +32,7 @@ history.
 
 ```bash
 git clone https://github.com/hydra-db/enterpriserag-bench-hydradb.git && cd enterpriserag-bench-hydradb
-uv venv --python 3.11 .venv && uv pip install --python .venv/bin/python -e ".[dev]"
+uv sync --locked --extra dev        # exact locked dependencies into .venv (or: uv venv --python 3.11 .venv && uv pip install --python .venv/bin/python -e ".[dev]")
 .venv/bin/python -m erb_hydradb doctor
 .venv/bin/python -m pytest
 .venv/bin/python -m erb_hydradb verify --run-dir artifacts/run-2026-09-04
@@ -40,8 +40,9 @@ uv venv --python 3.11 .venv && uv pip install --python .venv/bin/python -e ".[de
 .venv/bin/python -m erb_hydradb inspect --run-dir artifacts/run-2026-09-04 --question-id qst_0224
 ```
 
-Expected: `doctor` ends `READY` (keys are notes, not failures); 64 tests pass;
-`verify` lists every check as `OK` and ends `VERIFIED`; the audit reports 14
+Expected: `doctor` ends `READY` (keys are notes, not failures); the test suite
+passes; `verify` ends `VERIFIED` with every check `OK` except `pinned_checkout`,
+which is `INCOMPLETE` until you clone the benchmark; the audit reports 14
 flagged, 14 records, `ok: true`.
 
 **2. Try two questions. One LLM key, about $1.**
@@ -71,7 +72,7 @@ database, with expected outputs, costs, and what is safe to retry.
 | `src/erb_hydradb/` | The harness: corpus build, typed app-source conversion and ingestion, retrieval + generation, evaluator wrapper, validation, paired analysis. |
 | `METHODOLOGY.md` | What the pipeline does at each stage, what it does not do, provenance, run history. |
 | `REPRODUCE.md` | Reproduction levels, expected outputs, retry rules, troubleshooting. |
-| `tests/` | 64 offline tests, including a regression test for every false-success and data-loss case found in review. |
+| `tests/` | Offline tests, including a regression test for every false-success and data-loss case found in review, and stage-transition lifecycle tests. |
 | `THIRD_PARTY_NOTICES.md` | What is redistributed from the benchmark and under which license. |
 
 ## The pipeline in one paragraph

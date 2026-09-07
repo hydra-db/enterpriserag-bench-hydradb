@@ -46,9 +46,13 @@ def load_jsonl(path: str | Path) -> dict[str, dict]:
 def load_retrieval(checkpoint: str | Path | None, answers: str | Path | None) -> tuple[dict[str, list[str]], str]:
     """Doc ids in rank order per question: the checkpoint's saved top-50 if
     available, else the submitted document_ids (and say which)."""
+    from . import validate
     if checkpoint and Path(checkpoint).exists():
         with open(checkpoint, "r", encoding="utf-8") as f:
             rows = [r for r in json.load(f) if "question_id" in r]
+        dup = validate.check_ids(rows, None, "checkpoint")
+        if dup:
+            raise SystemExit("retrieval file rejected: " + "; ".join(dup))
         if rows and all("retrieved_doc_ids" in r for r in rows):
             return {r["question_id"]: r["retrieved_doc_ids"] for r in rows}, "checkpoint retrieved_doc_ids"
         if rows and all("document_ids" in r for r in rows):
@@ -127,13 +131,15 @@ def flips(a: dict, b: dict, ids: list[str]) -> dict:
 
 
 def recall_at(ranked: dict[str, list[str]], questions: dict[str, dict], ids: list[str], k: int) -> dict:
+    """Set-based, exactly as the evaluator: |set(submitted[:k]) & set(gold)| / |set(gold)|.
+    A gold list may repeat an id (qst_0413 does); the set is what counts."""
     rec, extra = [], []
     for i in ids:
         exp = set(questions[i].get("expected_doc_ids") or [])
-        sub = (ranked.get(i) or [])[:k]
+        sub = set((ranked.get(i) or [])[:k])
         if exp:
-            rec.append(100 * len(exp & set(sub)) / len(exp))
-            extra.append(sum(1 for d in sub if d not in exp))
+            rec.append(100 * len(exp & sub) / len(exp))
+            extra.append(len(sub - exp))
     return {"k": k, "recall_pct": round(st.mean(rec), 2) if rec else None,
             "invalid_extra": round(st.mean(extra), 2) if extra else None, "n": len(rec)}
 
@@ -215,7 +221,7 @@ def recall_compare(a_ranked: dict[str, list[str]], b_ranked: dict[str, list[str]
 
     def rec(ranked, k):
         return [100 * len(set(qs[i]["expected_doc_ids"]) & set(ranked.get(i, [])[:k]))
-                / len(qs[i]["expected_doc_ids"]) for i in ids]
+                / len(set(qs[i]["expected_doc_ids"])) for i in ids]
 
     rows = []
     for k in sorted({5, 10, ctx, 20, 50}):
@@ -270,7 +276,7 @@ def render_results_md(run_dir: str | Path, questions_path: str | Path, title: st
         for k in (1, 3, 5, 10, 20, 50):
             r = recall_at(ranked, qs, ids, k)
             out.append(f"| {k} | {r['recall_pct']} % | {r['invalid_extra']} |")
-        full = sum(1 for i in ids if set(qs[i]["expected_doc_ids"]) <= set(ranked[i][:10]))
+        full = sum(1 for i in ids if set(qs[i]["expected_doc_ids"]) <= set(ranked[i][:10]))  # set-based
         out += ["", f"Questions with every gold document inside the top 10: {full} of {len(ids)}.", ""]
     corr = run_dir / "corrections.jsonl"
     if corr.exists():

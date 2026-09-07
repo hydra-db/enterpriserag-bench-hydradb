@@ -203,9 +203,10 @@ def cmd_ingest(a: argparse.Namespace) -> int:
         ingest.run_ingest(cfg, paths.documents_db_path(), run_dir / "ingest_state.json", infer=not a.no_infer,
                           resume=a.resume, dry_run=a.dry_run, limit=a.limit, source_types=a.source_types,
                           batch_size=a.batch_size, batch_sleep=a.batch_sleep, provision=not a.no_provision,
-                          wait=not a.no_wait, api_key=key)
+                          wait=not a.no_wait, api_key=key, retry_failed=a.retry_failed,
+                          accept_failures=a.accept_failures)
     except incomplete as exc:
-        print(f"INCOMPLETE: {exc}\nre-run with --resume to reconcile outstanding items", file=sys.stderr)
+        print(f"INCOMPLETE: {exc}", file=sys.stderr)
         return EXIT_INCOMPLETE
     return 0
 
@@ -237,12 +238,20 @@ def cmd_generate(a: argparse.Namespace) -> int:
         store = _store(a.allow_unpinned)
         print(f"document store: {store.backend}")
     # validate any existing checkpoint against this run's identity BEFORE writing anything
-    identity = generate.run_identity(cfg, questions_path=qpath, from_contexts=from_contexts)
+    store_identity = None
+    if store is not None:
+        store_identity = dict(store.identity)
+        erb = paths.erb_repo()
+        if erb and (erb / "questions.jsonl").exists():
+            store_identity["checkout_commit"] = _checkout_commit(erb)
+    identity = generate.run_identity(cfg, questions_path=qpath, from_contexts=from_contexts,
+                                     store_identity=store_identity)
     generate.load_checkpoint(run_dir / "gen_checkpoint.json", identity, a.force_resume)
     cfg.save(run_dir / "config.yaml")
     _, incomplete = asyncio.run(generate.run_generate(
         cfg, run_dir, questions, api_key=os.environ.get("HYDRADB_API_KEY"), store=store, questions_path=qpath,
-        retrieval_only=a.retrieval_only, from_contexts=from_contexts, force_resume=a.force_resume))
+        retrieval_only=a.retrieval_only, from_contexts=from_contexts, force_resume=a.force_resume,
+        store_identity=store_identity))
     if incomplete:
         print(f"INCOMPLETE: {incomplete}. answers.jsonl is partial; re-run to retry errors"
               + ("" if a.allow_partial else " (exit 2; --allow-partial to accept)"), file=sys.stderr)
@@ -405,16 +414,30 @@ def cmd_audit_corrections(a: argparse.Namespace) -> int:
         problems.append(f"{q} is flagged corrected but has no correction record")
     for q in sorted(set(by_id) - flagged):
         problems.append(f"{q} has a correction record but is not flagged corrected")
+    answers = {r["question_id"]: r for r in validate.read_jsonl_rows(run_dir / "answers.jsonl")} \
+        if (run_dir / "answers.jsonl").exists() else {}
     for q, rec in by_id.items():
         o = originals.get(q)
         if o is None:
             problems.append(f"{q}: not in the questions file")
             continue
-        before = rec.get("before", {})
+        before, after = rec.get("before", {}), rec.get("after", {})
+        # the declared change flags must follow from before/after
+        if bool(rec.get("doc_set_changed")) != (set(before.get("expected_doc_ids") or []) != set(after.get("expected_doc_ids") or [])):
+            problems.append(f"{q}: doc_set_changed flag does not match before/after")
+        if bool(rec.get("gold_answer_changed")) != (before.get("gold_answer") != after.get("gold_answer")):
+            problems.append(f"{q}: gold_answer_changed flag does not match before/after")
+        # the corrected gold set must reproduce the results row's document recall
+        ans_row = answers.get(q)
+        if ans_row is not None:
+            rec_pct, _ = validate.retrieval_metrics(ans_row["document_ids"], set(after.get("expected_doc_ids") or []),
+                                                    set(after.get("valid_doc_ids") or []))
+            got = results[q].get("document_recall_pct")
+            if rec_pct is not None and got is not None and abs(rec_pct - float(got)) > 0.011:
+                problems.append(f"{q}: corrected gold set gives recall {rec_pct} but the results row says {got}")
         if (before.get("expected_doc_ids") != o["expected_doc_ids"] or before.get("gold_answer") != o["gold_answer"]
                 or before.get("answer_facts") != o["answer_facts"]):
             problems.append(f"{q}: 'before' does not equal the pinned original question")
-        after = rec.get("after", {})
         if not after.get("expected_doc_ids") or not after.get("gold_answer") or not isinstance(after.get("answer_facts"), list):
             problems.append(f"{q}: 'after' record incomplete")
         if not rec.get("update_reasons"):
@@ -507,6 +530,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--batch-sleep", type=float, default=1.0); s.add_argument("--no-provision", action="store_true")
     s.add_argument("--no-wait", action="store_true",
                    help="send without waiting for indexing status; the run ends INCOMPLETE (exit 2) until --resume reconciles it")
+    s.add_argument("--retry-failed", action="store_true", help="re-send the items HydraDB reported as failed (use with --resume)")
+    s.add_argument("--accept-failures", action="store_true",
+                   help="end with exit 0 even if some items failed; they are recorded in the manifest and the corpus is NOT ready")
     s.set_defaults(fn=cmd_ingest)
 
     s = sub.add_parser("generate"); s.add_argument("--config", required=True); s.add_argument("--run-dir", required=True)

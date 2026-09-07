@@ -18,6 +18,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import math
 from pathlib import Path
 
 from . import hydrate, manifest
@@ -72,6 +73,25 @@ def check_ids(rows: list[dict], expected: set[str] | None, label: str) -> list[s
     return problems
 
 
+def _finite(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _row_metric_problems(r: dict) -> str | None:
+    if not isinstance(r["answer_correct"], bool):
+        return "answer_correct is not a bool"
+    c = r["completeness_pct"]
+    if not _finite(c) or not 0 <= c <= 100:
+        return f"completeness_pct {c!r} is not a finite number in [0, 100]"
+    rec = r.get("document_recall_pct")
+    if rec is not None and (not _finite(rec) or not 0 <= rec <= 100):
+        return f"document_recall_pct {rec!r} is not None or a finite number in [0, 100]"
+    ex = r.get("invalid_extra_docs")
+    if ex is not None and (isinstance(ex, bool) or not isinstance(ex, int) or ex < 0):
+        return f"invalid_extra_docs {ex!r} is not None or a non-negative integer"
+    return None
+
+
 def expected_ids_from_questions(questions_path: Path) -> set[str]:
     return {r["question_id"] for r in read_jsonl_rows(questions_path)}
 
@@ -95,8 +115,9 @@ def check_results_file(path: Path, expected: set[str] | None) -> tuple[list[str]
         if missing:
             problems.append(f"{path.name}: row {r.get('question_id')} missing {sorted(missing)}")
             break
-        if not isinstance(r["answer_correct"], bool) or not isinstance(r["completeness_pct"], (int, float)):
-            problems.append(f"{path.name}: row {r.get('question_id')} has invalid answer_correct/completeness_pct")
+        bad = _row_metric_problems(r)
+        if bad:
+            problems.append(f"{path.name}: row {r.get('question_id')} {bad}")
             break
     problems += check_ids(rows, expected, path.name)
     if problems:
@@ -224,18 +245,79 @@ def check_sums_and_manifest(run_dir: Path, required: tuple[str, ...]) -> list[st
         try:
             with open(mpath, "r", encoding="utf-8") as f:
                 m = json.load(f)
+            # Each stage records the hashes of the files AS OF THAT STAGE. A later
+            # stage may rewrite the same file (resume, retry), so the file on disk
+            # must match the LATEST record that names it; earlier records are history.
+            latest: dict[str, tuple[str, str]] = {}
             for st in m.get("stages", []):
                 for rel, digest in (st.get("files") or {}).items():
-                    p = run_dir / rel
-                    if not p.exists():
-                        problems.append(f"manifest stage {st.get('stage')}: {rel} missing")
-                    elif manifest.sha256_file(p) != digest:
-                        problems.append(f"manifest stage {st.get('stage')}: {rel} hash differs from the file")
+                    latest[rel] = (st.get("stage"), digest)
+            for rel, (stage, digest) in latest.items():
+                p = run_dir / rel
+                if not p.exists():
+                    problems.append(f"manifest stage {stage}: {rel} missing")
+                elif manifest.sha256_file(p) != digest:
+                    problems.append(f"manifest stage {stage}: {rel} hash differs from the file")
         except (OSError, json.JSONDecodeError) as exc:
             problems.append(f"manifest.json unreadable ({exc})")
     for name in required:
         if not (run_dir / name).exists():
             problems.append(f"required file missing: {name}")
+    return problems
+
+
+def gold_sets(questions_path: Path, corrections_path: Path | None) -> dict[str, tuple[set[str], set[str]]]:
+    """question id -> (gold set, valid set): pinned gold, overridden by the
+    corrected 'after' state where a correction record exists."""
+    out = {}
+    for q in read_jsonl_rows(questions_path):
+        out[q["question_id"]] = (set(q.get("expected_doc_ids") or []), set())
+    if corrections_path and corrections_path.exists():
+        for c in read_jsonl_rows(corrections_path):
+            after = c.get("after", {})
+            out[c["question_id"]] = (set(after.get("expected_doc_ids") or []), set(after.get("valid_doc_ids") or []))
+    return out
+
+
+def retrieval_metrics(submitted: list[str], gold: set[str], valid: set[str]) -> tuple[float | None, int | None]:
+    """The evaluator's document recall and invalid-extra count, set-based."""
+    if not gold:
+        return None, None
+    s = set(submitted)
+    return round(100 * len(s & gold) / len(gold), 2), len(s - gold - valid)
+
+
+def check_retrieval_metrics(run_dir: Path, questions_path: Path) -> list[str]:
+    """Recompute document_recall_pct and invalid_extra_docs from the submitted ids
+    and the gold sets (pinned, or corrected 'after' sets with their valid docs for
+    the official protocol) and compare with the results rows."""
+    problems = []
+    answers = {r["question_id"]: r for r in read_jsonl_rows(run_dir / "answers.jsonl")}
+    for name, corrections in (("official_results_strict.json", None),
+                              ("official_results_protocol.json", run_dir / "corrections.jsonl")):
+        p = run_dir / name
+        if not p.exists():
+            continue
+        golds = gold_sets(questions_path, corrections)
+        with open(p, "r", encoding="utf-8") as f:
+            rows = json.load(f).get("questions", [])
+        n_bad = 0
+        for r in rows:
+            a = answers.get(r["question_id"])
+            if a is None or r["question_id"] not in golds:
+                continue
+            gold, valid = golds[r["question_id"]]
+            rec, extra = retrieval_metrics(a["document_ids"], gold, valid)
+            if rec is not None and r.get("document_recall_pct") is not None and abs(rec - float(r["document_recall_pct"])) > 0.011:
+                n_bad += 1
+                if n_bad <= 5:
+                    problems.append(f"{name}: {r['question_id']} document_recall_pct {r['document_recall_pct']} but submitted ids give {rec}")
+            if extra is not None and r.get("invalid_extra_docs") is not None and extra != r["invalid_extra_docs"]:
+                n_bad += 1
+                if n_bad <= 5:
+                    problems.append(f"{name}: {r['question_id']} invalid_extra_docs {r['invalid_extra_docs']} but submitted ids give {extra}")
+        if n_bad > 5:
+            problems.append(f"{name}: {n_bad} rows with retrieval metrics that do not follow from the submitted ids")
     return problems
 
 
@@ -292,9 +374,9 @@ def validate_run(run_dir: Path, questions_path: Path | None, *, required: tuple[
         elif name in required:
             record(name, ["missing"])
 
-    ctx_path = run_dir / "contexts.jsonl.gz"
+    ctx_path = next((run_dir / n for n in ("contexts.jsonl.gz", "contexts.jsonl") if (run_dir / n).exists()), None)
     ctx_rows: list[dict] = []
-    if ctx_path.exists():
+    if ctx_path is not None:
         try:
             ctx_rows = read_jsonl_rows(ctx_path)
             p = check_context_rows(ctx_rows, expected)
@@ -306,6 +388,23 @@ def validate_run(run_dir: Path, questions_path: Path | None, *, required: tuple[
             record("contexts", [str(exc)])
     elif "contexts.jsonl.gz" in required:
         record("contexts", ["missing"])
+
+    # answers must be what the checkpoint says was produced, and the deterministic
+    # retrieval metrics must follow from the submitted ids and the gold sets
+    if ans.exists() and ck_rows:
+        a_rows = {r["question_id"]: r for r in read_jsonl_rows(ans)}
+        p = []
+        for c in ck_rows:
+            a = a_rows.get(c["question_id"])
+            if a is None:
+                continue
+            if a["answer"] != c.get("answer", ""):
+                p.append(f"answers: {c['question_id']} answer text differs from the checkpoint")
+            if a["document_ids"] != c.get("document_ids", []):
+                p.append(f"answers: {c['question_id']} document_ids differ from the checkpoint")
+        record("answers_vs_checkpoint", p[:20])
+    if ans.exists() and questions_path and questions_path.exists():
+        record("retrieval_metrics", check_retrieval_metrics(run_dir, questions_path))
 
     if len(id_sets) >= 2:
         ref_name, ref = next(iter(id_sets.items()))

@@ -9,6 +9,7 @@ writing results files the way the real one does.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -76,6 +77,10 @@ class FakeProcs:
         assert not overlay.is_relative_to(self.checkout), "overlay must not live in the user's checkout"
         assert (overlay / "generated_data" / "uuid_index.json").exists()
         assert (overlay / "questions.jsonl").exists()
+        # the real evaluator may regenerate its UUID index cache: write it like it would
+        cache = Path(args["--uuid-index-cache-file"])
+        assert cache.is_relative_to(overlay), "uuid index cache must be harness-owned (inside the overlay)"
+        cache.write_text('{"regenerated_by": "fake evaluator"}')
         answers = Path(args["--answers-file"])
         results = Path(args["--results-file"])
         rows = [json.loads(line) for line in answers.read_text().splitlines() if line.strip()]
@@ -177,6 +182,16 @@ def _llm_bytes(root: Path) -> dict[str, bytes]:
     return {p.name: p.read_bytes() for p in sorted((root / "src" / "llm").glob("*.py"))}
 
 
+def _overlays(w, provider: str) -> list[Path]:
+    """Overlay directories built for ``provider`` (named ``<provider>-<identity hash>``)."""
+    root = w["data"] / "evaluator"
+    return sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith(f"{provider}-")) if root.exists() else []
+
+
+def _stage(w) -> dict:
+    return json.load(open(w["run_dir"] / "manifest.json"))["stages"][-1]
+
+
 # ------------------------------------------------- (a) checkout never touched --
 
 def test_missing_key_is_refused_before_any_filesystem_work(world, monkeypatch):
@@ -231,7 +246,8 @@ def test_local_modification_survives_openrouter_success_and_failure(world):
     assert _llm_bytes(w["erb"]) == before, "the user's checkout was modified"
     assert _git_checkouts(fake) == []
     # the overlay, not the checkout, carries the patch bytes
-    ov = _llm_bytes(w["data"] / "evaluator" / "openrouter")
+    [overlay] = _overlays(w, "openrouter")
+    ov = _llm_bytes(overlay)
     assert ov["openai_llm.py"] == (judge.PATCH_DIR / "openai_llm.py").read_bytes()
     assert ov["factory.py"] == (judge.PATCH_DIR / "factory.py").read_bytes()
     stage = json.load(open(w["run_dir"] / "manifest.json"))["stages"][-1]
@@ -277,20 +293,28 @@ def test_overlays_per_provider_coexist(world):
 
 
 def test_overlay_is_reused_until_source_or_patch_changes(world, monkeypatch):
+    """An overlay is immutable: the same identity is reused untouched; a changed
+    source tree or patch set is a *new* directory and the old one is left intact."""
     w = world
     first = judge.evaluator_overlay(w["erb"], "openrouter")
-    assert first.rebuilt
+    assert first.rebuilt and first.path.name.startswith("openrouter-")
     helper = first.path / "src" / "utils" / "helpers.py"
     mtime = helper.stat().st_mtime_ns
+    state = (first.path / "overlay.json").read_bytes()
     again = judge.evaluator_overlay(w["erb"], "openrouter")
-    assert not again.rebuilt and helper.stat().st_mtime_ns == mtime
+    assert not again.rebuilt and again.path == first.path and helper.stat().st_mtime_ns == mtime
+    assert (first.path / "overlay.json").read_bytes() == state, "reuse must not rewrite the overlay"
     (w["erb"] / "src" / "utils" / "helpers.py").write_bytes(b"X = 2\n")
     w["fake"].porcelain = " M src/utils/helpers.py\n"
     third = judge.evaluator_overlay(w["erb"], "openrouter", allow_unpinned=True)
-    assert third.rebuilt and helper.read_bytes() == b"X = 2\n"
+    assert third.rebuilt and third.path != first.path
+    assert (third.path / "src" / "utils" / "helpers.py").read_bytes() == b"X = 2\n"
+    assert helper.read_bytes() == b"X = 1\n", "the first overlay was modified"
     assert third.src_tree_sha256 != first.src_tree_sha256
     monkeypatch.setattr(judge, "patch_sha256s", lambda: {k: "0" * 64 for k in judge.PATCH_TARGETS})
-    assert judge.evaluator_overlay(w["erb"], "openrouter", allow_unpinned=True).rebuilt
+    fourth = judge.evaluator_overlay(w["erb"], "openrouter", allow_unpinned=True)
+    assert fourth.rebuilt and fourth.path not in (first.path, third.path)
+    assert len(_overlays(w, "openrouter")) == 3
 
 
 def test_overlay_falls_back_to_recorded_paths_without_symlinks(world, monkeypatch):
@@ -493,3 +517,194 @@ def test_judge_env_sets_provider_and_optional_cheap_model(world, monkeypatch):
     w["cfg"].judge.provider = "openai"
     env = judge.judge_env(w["cfg"])
     assert env["LLM_API_KEY"] == "oa-test" and "OPENROUTER_API_KEY" not in env
+
+
+# ------------------------------------ (g) 2026-09-07 re-review: plan identity --
+
+def test_reviewer_probe_same_plan_fresh_reruns_everything_and_archives(world):
+    """Reviewer probe P1-3b: with an identical plan `--fresh` used to be ignored
+    (reuse branch won, zero evaluator calls, nothing archived)."""
+    w, fake = world, world["fake"]
+    _official(w)
+    shard_dir = w["run_dir"] / "protocol_shards"
+    before = _snapshot(shard_dir)
+    fake.calls.clear()
+    spent = len(fake.evaluated)
+    _official(w, fresh=True)
+    archived = [p for p in w["run_dir"].glob("protocol_shards.*") if p.is_dir()]
+    assert len(archived) == 1 and _snapshot(archived[0]) == before
+    assert len(fake.evaluator_calls()) == 20 and not any("--resume" in c for c in fake.evaluator_calls())
+    assert len(fake.evaluated) == spent + N_ANSWERS, "every question must be judged again"
+    stage = _stage(w)
+    assert stage["archived_shards"] == str(archived[0]) and stage["shards_skipped"] == []
+    assert len(stage["shards_run"]) == 20
+    assert stage["plan_fingerprint"] == json.load(open(shard_dir / "shards.json"))["fingerprint"]
+    assert not (w["run_dir"] / judge.LOCK_FILE).exists()
+    assert judge.LOCK_FILE not in (w["run_dir"] / "SHA256SUMS").read_text()
+
+
+def test_reviewer_probe_changed_evaluator_source_is_a_different_plan(world):
+    """Reviewer probe P1-3a: after the evaluator source changed under allow_unpinned
+    a resume used to reuse every shard (zero calls) while recording the new hash."""
+    w, fake = world, world["fake"]
+    _official(w)
+    old = _stage(w)
+    assert old["overlay_identity"]["src_tree_sha256"] == old["evaluator_overlay"]["src_tree_sha256"]
+    (w["erb"] / "src" / "utils" / "helpers.py").write_bytes(b"X = 2\n")
+    fake.porcelain = " M src/utils/helpers.py\n"
+    fake.calls.clear()
+    with pytest.raises(judge.PlanMismatch, match="overlay_identity"):
+        _official(w, allow_unpinned=True)
+    assert fake.evaluator_calls() == []
+    assert _stage(w) == old, "no manifest stage may be written for a refused run"
+    _official(w, allow_unpinned=True, fresh=True)
+    new = _stage(w)
+    assert new["overlay_identity"]["src_tree_sha256"] != old["overlay_identity"]["src_tree_sha256"]
+    assert new["plan_fingerprint"] != old["plan_fingerprint"] and new["overlay_dir"] != old["overlay_dir"]
+    assert len(fake.evaluator_calls()) == 20 and new["archived_shards"]
+    plan = json.load(open(w["run_dir"] / "protocol_shards" / "shards.json"))
+    assert set(judge.FINGERPRINT_KEYS) <= set(plan)
+    assert set(plan["overlay_identity"]) == {"src_tree_sha256", "patch_sha256", "checkout_head"}
+    assert plan["corpus_identity"] == judge.manifest.sha256_file(w["erb"] / "generated_data" / "uuid_index.json")
+
+
+def test_changed_corpus_is_a_different_plan(world):
+    w, fake = world, world["fake"]
+    _official(w)
+    (w["erb"] / "generated_data" / "uuid_index.json").write_text('{"doc-1": "uuid-1"}')
+    fake.calls.clear()
+    with pytest.raises(judge.PlanMismatch, match="corpus_identity"):
+        _official(w)
+    assert fake.evaluator_calls() == []
+    _official(w, fresh=True)
+    assert len(fake.evaluator_calls()) == 20
+    assert _stage(w)["evaluator_overlay"]["corpus_sha256"] == judge.manifest.sha256_file(
+        w["erb"] / "generated_data" / "uuid_index.json")
+
+
+def test_reviewer_probe_two_checkouts_same_provider_get_distinct_immutable_overlays(world):
+    """Reviewer probe P1-3c: preparing a second checkout used to repoint the first
+    overlay's corpus symlink (data/evaluator/<provider>/ was shared and mutable)."""
+    import shutil
+    w = world
+    first = judge.evaluator_overlay(w["erb"], "openrouter", allow_unpinned=True)
+    first_state = (first.path / "overlay.json").read_bytes()
+    first_links = {n: os.readlink(first.path / n) for n in judge.OVERLAY_LINKS}
+    second_checkout = w["erb"].parent / "second-checkout"
+    shutil.copytree(w["erb"], second_checkout)
+    w["fake"].checkout = second_checkout          # fake git answers for either checkout
+    second = judge.evaluator_overlay(second_checkout, "openrouter", allow_unpinned=True)
+    assert first.path != second.path and second.path.parent == first.path.parent
+    assert first.path.name.startswith("openrouter-") and second.path.name.startswith("openrouter-")
+    assert (first.path / "generated_data").resolve() == (w["erb"] / "generated_data").resolve()
+    assert (second.path / "generated_data").resolve() == (second_checkout / "generated_data").resolve()
+    assert {n: os.readlink(first.path / n) for n in judge.OVERLAY_LINKS} == first_links
+    assert (first.path / "overlay.json").read_bytes() == first_state
+    assert first.identity["checkout"] != second.identity["checkout"]
+    assert judge.overlay_name(first.identity) == first.path.name
+    # a different revision of the same checkout is yet another overlay
+    w["fake"].checkout, w["fake"].head = w["erb"], "cafebabe" * 5
+    third = judge.evaluator_overlay(w["erb"], "openrouter", allow_unpinned=True)
+    assert third.path not in (first.path, second.path) and third.identity["checkout_head"] == "cafebabe" * 5
+    assert len(_overlays(w, "openrouter")) == 3
+
+
+def test_overlay_build_is_atomic(world, monkeypatch):
+    w = world
+    real_copyfile = judge.shutil.copyfile
+    copied = []
+
+    def die_mid_copy(src, dst, *a, **k):
+        copied.append(dst)
+        if len(copied) == 1:
+            raise OSError("disk full (simulated) mid-copy")
+        return real_copyfile(src, dst, *a, **k)
+    monkeypatch.setattr(judge.shutil, "copyfile", die_mid_copy)
+    with pytest.raises(OSError, match="simulated"):
+        judge.evaluator_overlay(w["erb"], "openrouter")
+    root = w["data"] / "evaluator"
+    assert list(root.iterdir()) == [], f"partial overlay left behind: {list(root.iterdir())}"
+    monkeypatch.setattr(judge.shutil, "copyfile", real_copyfile)
+    ov = judge.evaluator_overlay(w["erb"], "openrouter")
+    assert ov.rebuilt and [p.name for p in root.iterdir()] == [ov.path.name]
+    assert (ov.path / "overlay.json").exists() and (ov.path / "uuid_index.json").exists()
+    assert json.load(open(ov.path / "overlay.json"))["identity"] == ov.identity
+
+
+def test_run_dir_lock_refuses_concurrent_judge_and_clears_stale_lock(world, monkeypatch, capsys):
+    w, fake = world, world["fake"]
+    lock = w["run_dir"] / judge.LOCK_FILE
+    lock.write_text(json.dumps({"pid": os.getpid(), "started_at": "2026-09-07T00:00:00+00:00", "host": "h"}))
+    with pytest.raises(judge.RunLocked, match=str(os.getpid())):
+        _official(w)
+    assert fake.evaluator_calls() == [] and not (w["run_dir"] / "protocol_shards").exists()
+    assert lock.exists() and json.loads(lock.read_text())["pid"] == os.getpid(), "a live lock must not be touched"
+    # stale: the recorded pid is gone
+    lock.write_text(json.dumps({"pid": 4242, "started_at": "2026-09-06T00:00:00+00:00", "host": "h"}))
+    monkeypatch.setattr(judge, "_pid_alive", lambda pid: pid != 4242)
+    _official(w)
+    assert "stale lock" in capsys.readouterr().out
+    assert not lock.exists() and len(fake.evaluator_calls()) == 20
+    # a lock is held for the whole run and released even when the evaluator fails
+    fake.fail_shards = {"answers_03": 0}
+    seen = {}
+    real_run = judge._run_shards
+
+    def spy(*a, **k):
+        seen["locked"] = lock.exists() and json.loads(lock.read_text())["pid"] == os.getpid()
+        return real_run(*a, **k)
+    monkeypatch.setattr(judge, "_run_shards", spy)
+    (w["run_dir"] / "protocol_shards" / "results_03.json").unlink()
+    with pytest.raises(judge.EvaluatorFailed):
+        _official(w)
+    assert seen["locked"] and not lock.exists()
+
+
+def test_reviewer_probe_strict_refuses_bad_answers_before_any_subprocess(world):
+    """Reviewer probe H6a: a duplicate row used to reach the evaluator (money spent)
+    and was only caught by the results validation afterwards."""
+    w, fake = world, world["fake"]
+    good = w["answers"].read_text()
+
+    def refused(match):
+        with pytest.raises(judge.CoverageError, match=match):
+            _strict(w, expect_n=N_ANSWERS)
+        with pytest.raises(judge.CoverageError, match=match):
+            _official(w, expect_n=N_ANSWERS)
+        assert fake.calls == [], "no git and no evaluator call may happen before the answers file is validated"
+        assert not (w["data"] / "evaluator").exists() and not (w["run_dir"] / "protocol_shards").exists()
+
+    with w["answers"].open("a") as f:
+        f.write(json.dumps({"question_id": w["ids"][0], "answer": "conflicting duplicate", "document_ids": []}) + "\n")
+    refused("duplicate question ids")
+    w["answers"].write_text(good + json.dumps({"question_id": "qst_9999", "answer": "x", "document_ids": []}) + "\n")
+    refused("not in questions.jsonl")
+    w["answers"].write_text(good.replace('"document_ids": []', '"docs": []', 1))
+    refused("expected \\['answer', 'document_ids', 'question_id'\\]")
+    w["answers"].write_text(good.replace('"answer": "a"', '"answer": 7', 1))
+    refused("answer must be a string")
+    w["answers"].write_text(good + "{not json\n")
+    refused("invalid JSON")
+    w["answers"].write_text(good)
+    with pytest.raises(judge.CoverageError, match="expect_n 41"):
+        _official(w, expect_n=41)
+    assert fake.calls == []
+    _strict(w, expect_n=N_ANSWERS)
+    assert len(fake.evaluator_calls()) == 1
+
+
+def test_reviewer_probe_uuid_index_cache_is_harness_owned(world):
+    """Reviewer probe H6b: `--uuid-index-cache-file` used to point into the checkout,
+    which the evaluator may regenerate/write."""
+    w, fake = world, world["fake"]
+    checkout_copy = w["erb"] / "generated_data" / "uuid_index.json"
+    assert checkout_copy.read_bytes() == b"{}"
+    _strict(w)
+    _official(w)
+    for cmd in fake.evaluator_calls():
+        cache = Path(cmd[cmd.index("--uuid-index-cache-file") + 1])
+        overlay = Path(_stage(w)["overlay_dir"])
+        assert cache == overlay / "uuid_index.json" and not cache.is_relative_to(w["erb"])
+    assert checkout_copy.read_bytes() == b"{}", "the checkout's uuid_index.json was written"
+    assert (Path(_stage(w)["overlay_dir"]) / "uuid_index.json").read_text() == '{"regenerated_by": "fake evaluator"}'
+    assert _stage(w)["evaluator_overlay"]["uuid_index_cache"] == str(Path(_stage(w)["overlay_dir"]) / "uuid_index.json")
