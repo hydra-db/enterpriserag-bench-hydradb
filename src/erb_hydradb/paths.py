@@ -22,6 +22,8 @@ HF_DATASET = "onyx-dot-app/EnterpriseRAG-Bench"
 HF_QUESTIONS_CONFIG = "questions"
 HF_DOCUMENTS_CONFIG = "documents"
 HF_SPLIT = "test"
+# Dataset revision (git sha of the HF repo) to pin `download` to; None = the default branch, recorded as unpinned.
+HF_REVISION: str | None = None
 
 
 def repo_root() -> Path:

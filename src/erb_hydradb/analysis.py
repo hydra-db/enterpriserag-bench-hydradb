@@ -94,13 +94,8 @@ def recompute_stats(path: str | Path) -> dict:
         by_type[r["question_type"]].append(r)
     recomputed = {"aggregate_stats": stats_for_group(rows),
                   "question_type_stats": {t: stats_for_group(v) for t, v in by_type.items()}}
-    diffs = []
-    for k, v in recomputed["aggregate_stats"].items():
-        if k in data.get("aggregate_stats", {}) and abs(float(data["aggregate_stats"][k]) - float(v)) > 0.011:
-            diffs.append(f"aggregate {k}: file {data['aggregate_stats'][k]} vs recomputed {v}")
-    ids = [r["question_id"] for r in rows]
-    if len(ids) != len(set(ids)):
-        diffs.append(f"duplicate question ids: {len(ids) - len(set(ids))}")
+    from . import validate
+    diffs, _ = validate.check_results_file(Path(path), None)
     return {"n": len(rows), "recomputed": recomputed, "diffs": diffs}
 
 
@@ -146,15 +141,18 @@ def recall_at(ranked: dict[str, list[str]], questions: dict[str, dict], ids: lis
 def compare(a_path: str | Path, b_path: str | Path, questions_path: str | Path, *,
             ids_file: str | Path | None = None, expect_n: int | None = None,
             a_checkpoint=None, a_answers=None, b_checkpoint=None, b_answers=None) -> dict:
+    from . import validate
+    # validate RAW rows (schema, duplicates, every statistic) before collapsing by id
+    for tag, path in (("A", a_path), ("B", b_path)):
+        problems, _ = validate.check_results_file(Path(path), None)
+        if problems:
+            raise SystemExit(f"results file {tag} rejected: " + "; ".join(problems[:5]))
     a, b = results_by_id(a_path), results_by_id(b_path)
     qs = load_jsonl(questions_path)
     if expect_n is not None:
         for tag, res in (("A", a), ("B", b)):
-            bad = [q for q, r in res.items() if not isinstance(r.get("answer_correct"), bool)
-                   or r.get("completeness_pct") is None]
-            if len(res) != expect_n or bad:
-                raise SystemExit(f"COVERAGE FAILURE {tag}: {len(res)} judged rows (expected {expect_n}), "
-                                 f"{len(bad)} invalid rows {bad[:5]}")
+            if len(res) != expect_n:
+                raise SystemExit(f"COVERAGE FAILURE {tag}: {len(res)} judged rows (expected {expect_n})")
         if set(a) != set(b):
             raise SystemExit(f"COVERAGE FAILURE: question id sets differ ({len(set(a) ^ set(b))} ids)")
     ids = sorted(set(a) & set(b))
@@ -274,6 +272,20 @@ def render_results_md(run_dir: str | Path, questions_path: str | Path, title: st
             out.append(f"| {k} | {r['recall_pct']} % | {r['invalid_extra']} |")
         full = sum(1 for i in ids if set(qs[i]["expected_doc_ids"]) <= set(ranked[i][:10]))
         out += ["", f"Questions with every gold document inside the top 10: {full} of {len(ids)}.", ""]
+    corr = run_dir / "corrections.jsonl"
+    if corr.exists():
+        recs = [json.loads(line) for line in open(corr, "r", encoding="utf-8") if line.strip()]
+        out += ["## Gold corrections applied by the official protocol", "",
+                f"{len(recs)} questions had their gold set changed by the evaluator's three-judge correction step "
+                f"before scoring; each record in `corrections.jsonl` holds the pinned original and the corrected "
+                f"gold documents, gold answer and answer facts, with the judges' reasons. "
+                f"Document set changed: {sum(1 for r in recs if r.get('doc_set_changed'))}; gold answer changed: "
+                f"{sum(1 for r in recs if r.get('gold_answer_changed'))}. Check with `erb-hydradb audit-corrections`.", "",
+                "| Question | Type | Gold docs before | Gold docs after |", "|---|---|---|---|"]
+        for r in recs:
+            out.append(f"| {r['question_id']} | {r.get('question_type')} | {len(r['before']['expected_doc_ids'])} | "
+                       f"{len(r['after']['expected_doc_ids'])} |")
+        out.append("")
     if leaderboard:
         out += ["## Public leaderboard at the time of the run", "",
                 f"Source: {leaderboard.get('source', '')} ({leaderboard.get('date', '')}).", "",

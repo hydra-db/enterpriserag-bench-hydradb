@@ -88,6 +88,19 @@ class DocumentStore:
             )
 
     @property
+    def identity(self) -> dict:
+        """Where the documents come from, for manifests."""
+        out: dict = {"backend": self.backend}
+        if self._conn is not None:
+            try:
+                out["sqlite"] = {k: v for k, v in self._conn.execute("SELECT key, value FROM meta").fetchall()}
+            except sqlite3.OperationalError:
+                out["sqlite"] = {"source": "unknown"}
+        if self._sources is not None:
+            out["checkout"] = str(self._sources.parent.parent)
+        return out
+
+    @property
     def backend(self) -> str:
         if self._conn is not None and self._index is not None:
             return "sqlite+checkout"

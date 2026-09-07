@@ -1,0 +1,313 @@
+{
+  "aggregate_stats": {
+    "total_questions": 24,
+    "completed_questions": 24,
+    "skipped_rows": 0,
+    "num_corrected_questions": 0,
+    "average_correctness_pct": 75.0,
+    "average_completeness_pct": 72.43,
+    "combined_correctness_completeness_score": 70.35,
+    "average_recall_pct": 95.65,
+    "average_invalid_extra_docs": 47.3
+  },
+  "question_type_stats": {
+    "basic": {
+      "count": 11,
+      "average_correctness_pct": 90.91,
+      "average_completeness_pct": 90.91,
+      "combined_correctness_completeness_score": 90.91,
+      "average_recall_pct": 100.0,
+      "average_invalid_extra_docs": 49.0
+    },
+    "semantic": {
+      "count": 7,
+      "average_correctness_pct": 57.14,
+      "average_completeness_pct": 52.38,
+      "combined_correctness_completeness_score": 52.38,
+      "average_recall_pct": 85.71,
+      "average_invalid_extra_docs": 45.86
+    },
+    "intra_document_reasoning": {
+      "count": 1,
+      "average_correctness_pct": 100.0,
+      "average_completeness_pct": 100.0,
+      "combined_correctness_completeness_score": 100.0,
+      "average_recall_pct": 100.0,
+      "average_invalid_extra_docs": 49.0
+    },
+    "project_related": {
+      "count": 1,
+      "average_correctness_pct": 100.0,
+      "average_completeness_pct": 75.0,
+      "combined_correctness_completeness_score": 75.0,
+      "average_recall_pct": 100.0,
+      "average_invalid_extra_docs": 33.0
+    },
+    "conflicting_info": {
+      "count": 1,
+      "average_correctness_pct": 100.0,
+      "average_completeness_pct": 80.0,
+      "combined_correctness_completeness_score": 80.0,
+      "average_recall_pct": 100.0,
+      "average_invalid_extra_docs": 48.0
+    },
+    "miscellaneous": {
+      "count": 2,
+      "average_correctness_pct": 0.0,
+      "average_completeness_pct": 25.0,
+      "combined_correctness_completeness_score": 0.0,
+      "average_recall_pct": 100.0,
+      "average_invalid_extra_docs": 49.0
+    },
+    "high_level": {
+      "count": 1,
+      "average_correctness_pct": 100.0,
+      "average_completeness_pct": 66.67,
+      "combined_correctness_completeness_score": 66.67,
+      "average_recall_pct": 0.0,
+      "average_invalid_extra_docs": 0.0
+    }
+  },
+  "questions": [
+    {
+      "question_id": "qst_0018",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": true,
+      "correctness_reasoning": "It exactly matches the gold answer's metric name and describes the same counter behavior.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0040",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": true,
+      "correctness_reasoning": "It matches the key retention windows and conditions from the gold answer: 30 seconds in memory, 7 days indexed, and 90 days in cold archive only for snapshots older than 7 days if pinned.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0067",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": true,
+      "correctness_reasoning": "It matches the gold answer\u2019s core findings that compression helped on 40+ column datasets but lacked discoverability and needed a subtle persistent header affordance with better tooltip wording.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0082",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": true,
+      "correctness_reasoning": "The candidate matches the gold answer by identifying the cause as a networking flake in a single region due to route table asymmetry, with slower-than-expected KV cache warming during autoscale reshuffling contributing.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0092",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": false,
+      "correctness_reasoning": "The candidate does not provide the required start time, region, or traffic ramp and instead says the information cannot be determined, which conflicts with the gold answer.",
+      "completeness_pct": 0.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0102",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": true,
+      "correctness_reasoning": "It matches the gold answer\u2019s core guidance exactly on the default p-value threshold and the 500/100 requests-per-slice minimum sample sizes, with only additional non-conflicting details.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0118",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": true,
+      "correctness_reasoning": "The candidate closely matches the gold answer\u2019s evidence-first pipeline, including 1\u20135%/1\u20132 week sampling, offline clustering, ~10k-request profiling, buffered per-cluster SLO derivation, cost-sensitivity/fallback guidance, and monitoring/revalidation, without conflicting on key quantities.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0119",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": true,
+      "correctness_reasoning": "It matches the gold answer that must-log admin actions should fall back to the local WAL when the buffer is full, and if the WAL cannot be written or hits its size cap the action fails closed with HTTP 503 and a deterministic audit-unavailable error.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0121",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": true,
+      "correctness_reasoning": "The candidate gives the same due date, 2026-12-08, and is consistent with the gold answer that the benchmark/results are due by that date.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0151",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": true,
+      "correctness_reasoning": "The candidate matches the gold answer\u2019s core cause and effect: Security change SUDO-2026-031 removed the ci-agent sudoers rule, sudo denied /usr/local/bin/artifact-uploader, and the upload step failed with exit code 126.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0168",
+      "corrected": false,
+      "question_type": "basic",
+      "answer_correct": true,
+      "correctness_reasoning": "It matches the gold answer exactly on both the HTTP method (POST) and endpoint (/optimize/v1/suggestions), and the extra details do not conflict.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0190",
+      "corrected": false,
+      "question_type": "semantic",
+      "answer_correct": false,
+      "correctness_reasoning": "The candidate does not provide the required cause or the field to remove, and instead says the information is unavailable, which conflicts with the gold answer.",
+      "completeness_pct": 0.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0191",
+      "corrected": false,
+      "question_type": "semantic",
+      "answer_correct": false,
+      "correctness_reasoning": "The candidate answer denies that a suspected shared cause is known, which conflicts with the gold answer's specific cause of OOM-killed indexer pods causing unflushed commit/audit data.",
+      "completeness_pct": 0.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0222",
+      "corrected": false,
+      "question_type": "semantic",
+      "answer_correct": true,
+      "correctness_reasoning": "It correctly identifies the Confluence page as \"Operational Flows and Policy Gallery\" and points to the \"Templates and artifacts (canonical)\" section with the matching template links.",
+      "completeness_pct": 66.67,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 26
+    },
+    {
+      "question_id": "qst_0251",
+      "corrected": false,
+      "question_type": "semantic",
+      "answer_correct": false,
+      "correctness_reasoning": "The candidate answer gives different performance targets and metrics than the gold answer, conflicting on both the overnight vectorization throughput and the interactive top-10 response latency.",
+      "completeness_pct": 0.0,
+      "document_recall_pct": 0.0,
+      "invalid_extra_docs": 50
+    },
+    {
+      "question_id": "qst_0261",
+      "corrected": false,
+      "question_type": "semantic",
+      "answer_correct": true,
+      "correctness_reasoning": "It matches the gold answer\u2019s core idea: the neon-orchestrated hybrid attention path dynamically switches between Flash-style and neon-tiled attention at runtime and uses lazy-KV streaming to avoid expensive KV page swaps on long contexts.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0288",
+      "corrected": false,
+      "question_type": "semantic",
+      "answer_correct": true,
+      "correctness_reasoning": "The candidate answer matches the gold answer on the one-time INF-324 exception and the amount approved: up to 10% above the midpoint.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0299",
+      "corrected": false,
+      "question_type": "semantic",
+      "answer_correct": true,
+      "correctness_reasoning": "The candidate gives the same required receipt date, 2026-09-03, and correctly ties it to the 2026-09-09 staging deadline.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0336",
+      "corrected": false,
+      "question_type": "intra_document_reasoning",
+      "answer_correct": true,
+      "correctness_reasoning": "It matches both key facts in the gold answer: the kickoff is Wed 7/31 at 10:00 PT and peak bursts are about 120 requests/second.",
+      "completeness_pct": 100.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0345",
+      "corrected": false,
+      "question_type": "project_related",
+      "answer_correct": true,
+      "correctness_reasoning": "It matches the gold on the key positions\u2014US-region/VPC content residency without absolute no-cross-border language, 7-year retention via customer export/SIEM rather than Redwood retention, and secure NDA-governed evidence sharing\u2014though it omits some listed architecture artifacts.",
+      "completeness_pct": 75.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 33
+    },
+    {
+      "question_id": "qst_0411",
+      "corrected": false,
+      "question_type": "conflicting_info",
+      "answer_correct": true,
+      "correctness_reasoning": "It matches the gold answer\u2019s key point that 30% of interactive burst credits should be reserved for priority=high routes and does not conflict with it.",
+      "completeness_pct": 80.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 48
+    },
+    {
+      "question_id": "qst_0459",
+      "corrected": false,
+      "question_type": "miscellaneous",
+      "answer_correct": false,
+      "correctness_reasoning": "It conflicts with the gold answer by giving the wrong day and incorrectly saying no time zone was stated when the deadline was 2026-03-05 at 17:00 UTC.",
+      "completeness_pct": 0.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0466",
+      "corrected": false,
+      "question_type": "miscellaneous",
+      "answer_correct": false,
+      "correctness_reasoning": "The candidate identifies Marcus Chen as captain but contradicts the gold answer by saying no single person volunteered to both captain and organize practices.",
+      "completeness_pct": 50.0,
+      "document_recall_pct": 100.0,
+      "invalid_extra_docs": 49
+    },
+    {
+      "question_id": "qst_0476",
+      "corrected": false,
+      "question_type": "high_level",
+      "answer_correct": true,
+      "correctness_reasoning": "It matches the core point that Redwood differentiates via built-in reliability and graceful degradation through preconfigured fallback routing to compatible model variants/regions to keep apps online when issues or capacity constraints occur.",
+      "completeness_pct": 66.67,
+      "document_recall_pct": null,
+      "invalid_extra_docs": null
+    }
+  ]
+}

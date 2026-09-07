@@ -59,6 +59,15 @@ _INSERT = (
     "INSERT OR IGNORE INTO documents (doc_id, source_type, title, content, content_len) "
     "VALUES (?, ?, ?, ?, ?)"
 )
+# Corpus identity: which upstream source (and revision) the rows came from.
+# A build refuses to add rows from a different identity, so two source
+# versions can never be mixed silently.
+_CREATE_META = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
 
 Row = tuple[str, str, str, str, int]  # (doc_id, source_type, title, content, content_len)
 
@@ -174,15 +183,49 @@ def _open_for_build(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous = OFF;")
     conn.execute("PRAGMA temp_store = MEMORY;")
     conn.execute(_CREATE_TABLE)
+    conn.execute(_CREATE_META)
     return conn
 
 
+def corpus_identity(db_path: str | Path) -> dict:
+    """The identity recorded by the builder: {"source": "repo"|"hf", "revision": ..., "built_at": ..., "rows": n}."""
+    conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True)
+    try:
+        try:
+            rows = conn.execute("SELECT key, value FROM meta").fetchall()
+        except sqlite3.OperationalError:
+            return {"source": "unknown", "revision": None}
+        ident = {k: v for k, v in rows}
+        ident["rows"] = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        return ident
+    finally:
+        conn.close()
+
+
+def _set_identity(conn: sqlite3.Connection, identity: dict) -> None:
+    existing = {k: v for k, v in conn.execute("SELECT key, value FROM meta").fetchall()}
+    for k in ("source", "revision"):
+        if k in existing and existing[k] != str(identity.get(k)):
+            raise ValueError(
+                f"documents.sqlite was built from {existing.get('source')}@{existing.get('revision')}; "
+                f"refusing to add rows from {identity.get('source')}@{identity.get('revision')}. "
+                "Delete the file to rebuild it."
+            )
+    for k, v in identity.items():
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (k, str(v)))
+    conn.commit()
+
+
 def build_documents_db(db_path: str | Path, rows: Iterable[Row], *, limit: int | None = None,
-                       quiet: bool = False) -> int:
-    """Insert ``rows`` into ``documents.sqlite`` (idempotent). Returns the table's row count."""
+                       quiet: bool = False, identity: dict | None = None) -> int:
+    """Insert ``rows`` into ``documents.sqlite`` (idempotent within one identity).
+    Returns the table's row count. ``identity`` names the source and revision;
+    a file built from a different identity is refused."""
     db_path = Path(db_path)
     conn = _open_for_build(db_path)
     try:
+        _set_identity(conn, {"source": "unknown", "revision": None, **(identity or {}),
+                             "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
         already = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         if already and not quiet:
             print(f"[documents] {already:,} rows already present; duplicates are skipped", flush=True)
@@ -220,12 +263,16 @@ def build_documents_db(db_path: str | Path, rows: Iterable[Row], *, limit: int |
 
 def build_from_repo(erb_repo: str | Path, db_path: str | Path, *, source_types: Iterable[str] | None = None,
                     limit: int | None = None, quiet: bool = False) -> int:
-    """Build ``documents.sqlite`` from a benchmark checkout."""
-    return build_documents_db(db_path, iter_repo_rows(erb_repo, source_types), limit=limit, quiet=quiet)
+    """Build ``documents.sqlite`` from a benchmark checkout (identity = repo@<HEAD>)."""
+    import subprocess
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(erb_repo), capture_output=True, text=True).stdout.strip()
+    return build_documents_db(db_path, iter_repo_rows(erb_repo, source_types), limit=limit, quiet=quiet,
+                              identity={"source": "repo", "revision": head or "unknown",
+                                        "source_types": ",".join(sorted(source_types)) if source_types else "all"})
 
 
 def build_from_hf(db_path: str | Path, *, limit: int | None = None, quiet: bool = False,
-                  dataset: Iterable[dict] | None = None) -> int:
+                  dataset: Iterable[dict] | None = None, revision: str | None = None) -> int:
     """Build ``documents.sqlite`` by streaming the Hugging Face ``documents`` config.
 
     ``dataset`` may be supplied (any iterable of row dicts) to bypass the
@@ -242,8 +289,9 @@ def build_from_hf(db_path: str | Path, *, limit: int | None = None, quiet: bool 
             print(f"[documents] streaming {paths.HF_DATASET} config '{paths.HF_DOCUMENTS_CONFIG}' "
                   f"split '{paths.HF_SPLIT}' (limit={limit or 'none'}) ...", flush=True)
         dataset = load_dataset(paths.HF_DATASET, paths.HF_DOCUMENTS_CONFIG, split=paths.HF_SPLIT,
-                               streaming=True)
-    return build_documents_db(db_path, iter_hf_rows(dataset), limit=limit, quiet=quiet)
+                               streaming=True, revision=revision or paths.HF_REVISION)
+    return build_documents_db(db_path, iter_hf_rows(dataset), limit=limit, quiet=quiet,
+                              identity={"source": "hf", "revision": revision or paths.HF_REVISION or "main (unpinned)"})
 
 
 # ---------------------------------------------------------------------------

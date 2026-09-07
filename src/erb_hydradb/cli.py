@@ -1,5 +1,6 @@
 """``erb-hydradb`` command line.
 
+    doctor     preflight: environment, keys by stage, pins, corpus, contexts (no cost)
     setup      clone EnterpriseRAG-Bench at the pinned commit, verify questions.jsonl
     download   build data/documents.sqlite (from the checkout, or from Hugging Face)
     ingest     load the corpus into a HydraDB collection as typed app sources
@@ -8,9 +9,13 @@
     report     write RESULTS.md for a run directory
     compare    paired comparison of two results files
     recall     paired document-recall comparison of two retrieval runs
-    verify     checksums + recomputed statistics for a run directory
+    verify     validate a run directory (files, schema, coverage, statistics, contexts)
     stats      recompute the evaluator's aggregates from a results file
+    audit-corrections   check the official protocol's gold corrections against the published record
+    inspect    everything about one question: retrieval, context, answer, judgments, correction
 
+Exit codes: 0 ok · 1 usage / input problem · 2 the run completed with failures
+or incomplete coverage (see the output; use --allow-partial to accept).
 Reproduction levels are described in REPRODUCE.md.
 """
 
@@ -28,13 +33,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from . import analysis, manifest, paths
+from . import analysis, manifest, paths, validate
 from .config import RunConfig
 
+EXIT_INCOMPLETE = 2
 
-def _die(msg: str) -> None:
+
+def _die(msg: str, code: int = 1) -> None:
     print(f"error: {msg}", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(code)
 
 
 def _checkout_commit(root: Path) -> str:
@@ -60,8 +67,8 @@ def _erb_root(arg: str | None, allow_unpinned: bool = False) -> Path:
 def _questions(arg: str | None, allow_unpinned: bool = False) -> Path:
     """The official questions file: --questions, else data/questions.jsonl (from
     setup), else the copy shipped in tests/data. Its sha256 must match the pin."""
-    candidates = [Path(arg).expanduser().resolve()] if arg else [paths.questions_path(),
-                                                                  paths.repo_root() / "tests" / "data" / "questions.jsonl"]
+    candidates = [Path(arg).expanduser().resolve()] if arg else [
+        paths.questions_path(), paths.repo_root() / "tests" / "data" / "questions.jsonl"]
     p = next((c for c in candidates if c.exists()), None)
     if p is None:
         _die("questions.jsonl not found; run `erb-hydradb setup`")
@@ -78,14 +85,80 @@ def _sha(p: Path) -> str:
     return manifest.sha256_file(p)
 
 
+def _store(allow_unpinned: bool = False):
+    from . import hydrate
+    erb = paths.erb_repo()
+    if erb and not paths.documents_db_path().exists():
+        _erb_root(str(erb), allow_unpinned)
+    return hydrate.DocumentStore(paths.documents_db_path(), erb)
+
+
+# ----------------------------------------------------------------- doctor --
+
+def cmd_doctor(a: argparse.Namespace) -> int:
+    """Preflight without spending anything."""
+    import platform
+    ok = True
+
+    def line(status: str, what: str, detail: str = ""):
+        nonlocal ok
+        if status == "FAIL":
+            ok = False
+        print(f"{status:5s} {what}" + (f": {detail}" if detail else ""))
+
+    line("ok", "python", platform.python_version())
+    for mod in ("httpx", "openai", "yaml", "pydantic", "tiktoken", "anthropic"):
+        try:
+            __import__(mod)
+            line("ok", f"import {mod}")
+        except ImportError:
+            line("FAIL", f"import {mod}", "run: uv pip install -e '.[dev]'")
+    for var, stage in (("OPENROUTER_API_KEY", "generate/judge via OpenRouter (levels 1-4)"),
+                       ("OPENAI_API_KEY", "generate/judge via OpenAI (alternative)"),
+                       ("HYDRADB_API_KEY", "generate against HydraDB / ingest (levels 3-4)")):
+        line("ok" if os.environ.get(var) else "note", var, ("set" if os.environ.get(var) else "not set") + f" — {stage}")
+    q = next((c for c in (paths.questions_path(), paths.repo_root() / "tests" / "data" / "questions.jsonl") if c.exists()), None)
+    if q:
+        line("ok" if _sha(q) == paths.QUESTIONS_SHA256 else "FAIL", "questions.jsonl", f"{q} sha256 {'matches' if _sha(q) == paths.QUESTIONS_SHA256 else 'DOES NOT MATCH'} the pin")
+    else:
+        line("FAIL", "questions.jsonl", "not found (run setup)")
+    root = paths.erb_repo()
+    if root and (root / "questions.jsonl").exists():
+        head = _checkout_commit(root)
+        dirty = subprocess.run(["git", "status", "--porcelain", "--", "src"], cwd=root, capture_output=True, text=True).stdout.strip()
+        line("ok" if head == paths.ERB_COMMIT else "FAIL", "benchmark checkout", f"{root} at {head[:12]}" + ("" if head == paths.ERB_COMMIT else f" (pinned {paths.ERB_COMMIT[:12]})"))
+        line("ok" if not dirty else "note", "checkout src/ clean", "yes" if not dirty else f"modified: {dirty.splitlines()[:3]}")
+    else:
+        line("note", "benchmark checkout", "not present — needed for judge and level 3+ (run setup)")
+    db = paths.documents_db_path()
+    if db.exists():
+        try:
+            from . import corpus
+            ident = corpus.corpus_identity(db)
+            line("ok", "documents.sqlite", f"{ident}")
+        except Exception as exc:  # noqa: BLE001
+            line("note", "documents.sqlite", f"present, identity unreadable ({exc})")
+    else:
+        line("note", "documents.sqlite", "not built — hydration falls back to the checkout; run download")
+    ctx = paths.artifacts_dir() / "run-2026-09-04" / "contexts.jsonl.gz"
+    line("ok" if ctx.exists() else "FAIL", "published contexts", str(ctx))
+    try:
+        free = shutil.disk_usage(paths.repo_root()).free / 2**30
+        line("ok" if free > 8 else "note", "disk free", f"{free:.1f} GB (the checkout needs ~5 GB)")
+    except OSError:
+        pass
+    print("READY" if ok else "NOT READY")
+    return 0 if ok else 1
+
+
 # ------------------------------------------------------------------ setup --
 
 def cmd_setup(a: argparse.Namespace) -> int:
     root = Path(a.erb_dir).expanduser().resolve() if a.erb_dir else paths.repo_root() / "EnterpriseRAG-Bench"
     if not root.exists():
-        print(f"cloning {paths.ERB_REPO_URL} -> {root}")
+        print(f"cloning {paths.ERB_REPO_URL} -> {root} (about 5 GB on disk)")
         subprocess.run(["git", "clone", "--filter=blob:none", paths.ERB_REPO_URL, str(root)], check=True)
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
+    head = _checkout_commit(root)
     if head != paths.ERB_COMMIT:
         print(f"checking out pinned commit {paths.ERB_COMMIT}")
         subprocess.run(["git", "fetch", "--depth", "1", "origin", paths.ERB_COMMIT], cwd=root, check=False)
@@ -111,7 +184,7 @@ def cmd_download(a: argparse.Namespace) -> int:
         n = corpus.build_from_repo(root, db, limit=a.limit)
     else:
         n = corpus.build_from_hf(db, limit=a.limit)
-    print(f"ok: {n} documents in {db}")
+    print(f"ok: {n} documents in {db}; identity {corpus.corpus_identity(db)}")
     return 0
 
 
@@ -125,23 +198,29 @@ def cmd_ingest(a: argparse.Namespace) -> int:
         _die("HYDRADB_API_KEY is not set")
     run_dir = Path(a.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    ingest.run_ingest(cfg, paths.documents_db_path(), run_dir / "ingest_state.json", infer=not a.no_infer,
-                      resume=a.resume, dry_run=a.dry_run, limit=a.limit, source_types=a.source_types,
-                      batch_size=a.batch_size, batch_sleep=a.batch_sleep, provision=not a.no_provision,
-                      wait=not a.no_wait, api_key=key)
+    incomplete = getattr(ingest, "IngestIncomplete", RuntimeError)
+    try:
+        ingest.run_ingest(cfg, paths.documents_db_path(), run_dir / "ingest_state.json", infer=not a.no_infer,
+                          resume=a.resume, dry_run=a.dry_run, limit=a.limit, source_types=a.source_types,
+                          batch_size=a.batch_size, batch_sleep=a.batch_sleep, provision=not a.no_provision,
+                          wait=not a.no_wait, api_key=key)
+    except incomplete as exc:
+        print(f"INCOMPLETE: {exc}\nre-run with --resume to reconcile outstanding items", file=sys.stderr)
+        return EXIT_INCOMPLETE
     return 0
 
 
 # --------------------------------------------------------------- generate --
 
 def cmd_generate(a: argparse.Namespace) -> int:
-    from . import generate, hydrate, llm
+    from . import generate, llm
     cfg = RunConfig.load(a.config)
     run_dir = Path(a.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    cfg.save(run_dir / "config.yaml")
-    questions = generate.select_questions(generate.load_questions(_questions(a.questions, a.allow_unpinned)),
-                                          a.targets, a.n)
+    qpath = _questions(a.questions, a.allow_unpinned)
+    questions = generate.select_questions(generate.load_questions(qpath), a.targets, a.n)
+    if not questions:
+        _die("no questions selected")
     if not a.retrieval_only and not llm.provider_available(cfg.generation.provider):
         _die(f"no key for generation provider {cfg.generation.provider!r}")
     from_contexts = None
@@ -155,14 +234,19 @@ def cmd_generate(a: argparse.Namespace) -> int:
             src = plain
         from_contexts = src
     else:
-        erb = paths.erb_repo()
-        if erb and not paths.documents_db_path().exists():
-            _erb_root(str(erb), a.allow_unpinned)   # enforce the pin when hydrating from the checkout
-        store = hydrate.DocumentStore(paths.documents_db_path(), erb)
+        store = _store(a.allow_unpinned)
         print(f"document store: {store.backend}")
-    asyncio.run(generate.run_generate(cfg, run_dir, questions, api_key=os.environ.get("HYDRADB_API_KEY"),
-                                      store=store, retrieval_only=a.retrieval_only, from_contexts=from_contexts,
-                                      force_resume=a.force_resume))
+    # validate any existing checkpoint against this run's identity BEFORE writing anything
+    identity = generate.run_identity(cfg, questions_path=qpath, from_contexts=from_contexts)
+    generate.load_checkpoint(run_dir / "gen_checkpoint.json", identity, a.force_resume)
+    cfg.save(run_dir / "config.yaml")
+    _, incomplete = asyncio.run(generate.run_generate(
+        cfg, run_dir, questions, api_key=os.environ.get("HYDRADB_API_KEY"), store=store, questions_path=qpath,
+        retrieval_only=a.retrieval_only, from_contexts=from_contexts, force_resume=a.force_resume))
+    if incomplete:
+        print(f"INCOMPLETE: {incomplete}. answers.jsonl is partial; re-run to retry errors"
+              + ("" if a.allow_partial else " (exit 2; --allow-partial to accept)"), file=sys.stderr)
+        return 0 if a.allow_partial else EXIT_INCOMPLETE
     return 0
 
 
@@ -179,20 +263,31 @@ def cmd_judge(a: argparse.Namespace) -> int:
     root = _erb_root(a.erb, a.allow_unpinned)
     q = _questions(a.questions, a.allow_unpinned)
     results = Path(a.results).resolve() if a.results else None
-    if a.protocol == "strict":
-        out = judge.run_strict(cfg, run_dir, root, q, answers, results, question_id=a.question_id)
-    else:
-        if a.question_id:
-            _die("--question-id is only supported with --protocol strict")
-        out = judge.run_official(cfg, run_dir, root, q, answers, results, expect_n=a.expect_n)
+    expected = {r["question_id"] for r in validate.read_jsonl_rows(answers)}
+    if a.expect_n is not None and len(expected) != a.expect_n:
+        _die(f"answers file has {len(expected)} unique question ids, --expect-n says {a.expect_n}")
+    kw = {"allow_unpinned": a.allow_unpinned, "fresh": a.fresh}
+    try:
+        if a.protocol == "strict":
+            out = judge.run_strict(cfg, run_dir, root, q, answers, results, question_id=a.question_id,
+                                   expect_n=None if a.question_id else a.expect_n, **kw)
+        else:
+            if a.question_id:
+                _die("--question-id is only supported with --protocol strict")
+            out = judge.run_official(cfg, run_dir, root, q, answers, results, expect_n=a.expect_n, **kw)
+    except judge.JudgeError as exc:
+        print(f"JUDGE FAILED ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return EXIT_INCOMPLETE
+    problems, data = validate.check_results_file(Path(out), None if a.question_id else expected)
     rc = analysis.recompute_stats(out)
     agg = rc["recomputed"]["aggregate_stats"]
     print(f"\n{a.protocol}: n={rc['n']} combined={agg['combined_correctness_completeness_score']} "
           f"correctness={agg['average_correctness_pct']} completeness={agg['average_completeness_pct']} "
           f"recall={agg['average_recall_pct']} invalid_extra={agg['average_invalid_extra_docs']}")
-    if rc["diffs"]:
-        print(f"WARNING recomputation mismatches: {rc['diffs']}")
     print(f"results -> {out}")
+    if problems:
+        print("RESULTS FAILED VALIDATION:\n  " + "\n  ".join(problems[:10]), file=sys.stderr)
+        return EXIT_INCOMPLETE
     return 0
 
 
@@ -243,94 +338,154 @@ def cmd_recall(a: argparse.Namespace) -> int:
 
 def cmd_verify(a: argparse.Namespace) -> int:
     run_dir = Path(a.run_dir).resolve()
-    ok = True
-    problems = manifest.verify_sums(run_dir)
-    if problems:
-        ok = False
-        print("checksums: FAIL"); [print("  " + p) for p in problems]
-    else:
-        print("checksums: ok")
-    for name in ("official_results_strict.json", "official_results_protocol.json"):
-        p = run_dir / name
-        if p.exists():
-            rc = analysis.recompute_stats(p)
-            agg = rc["recomputed"]["aggregate_stats"]
-            status = "ok" if not rc["diffs"] else f"MISMATCH {rc['diffs']}"
-            ok = ok and not rc["diffs"]
-            print(f"{name}: n={rc['n']} combined={agg['combined_correctness_completeness_score']} "
-                  f"correctness={agg['average_correctness_pct']} completeness={agg['average_completeness_pct']} "
-                  f"recall={agg['average_recall_pct']} -> {status}")
+    qpath = None
+    try:
+        qpath = _questions(a.questions, True)
+    except SystemExit:
+        pass
+    required = validate.REQUIRED_PUBLISHED if not a.minimal else ("SHA256SUMS",)
+    if a.minimal:
+        qpath = None   # a partial run (pilot): coverage is checked by cross-file equality only
+    store = None
+    cfg = RunConfig.load(run_dir / "config.yaml") if (run_dir / "config.yaml").exists() else RunConfig()
+    if a.contexts:
+        try:
+            store = _store(True)
+        except (FileNotFoundError, SystemExit):
+            store = None
+    report = validate.validate_run(run_dir, qpath, required=required, contexts=a.contexts, store=store,
+                                   docs_in_context=cfg.generation.docs_in_context,
+                                   max_context_chars=cfg.generation.max_context_chars)
     root = paths.erb_repo()
     if root and (root / "questions.jsonl").exists():
         head = _checkout_commit(root)
-        qh = _sha(root / "questions.jsonl")
-        print(f"checkout commit: {head[:12]} ({'ok' if head == paths.ERB_COMMIT else 'DIFFERS from pinned ' + paths.ERB_COMMIT[:12]})")
-        print(f"questions.jsonl sha256: {'ok' if qh == paths.QUESTIONS_SHA256 else 'DIFFERS'}")
-        ok = ok and head == paths.ERB_COMMIT and qh == paths.QUESTIONS_SHA256
+        report["checks"]["pinned_checkout"] = {
+            "status": "ok" if head == paths.ERB_COMMIT else "fail",
+            "problems": [] if head == paths.ERB_COMMIT else [f"checkout at {head[:12]}, pinned {paths.ERB_COMMIT[:12]}"],
+            "commit": head[:12]}
     else:
-        print("checkout: not present (run `erb-hydradb setup` to verify the pinned commit)")
-    if a.contexts:
-        res = _context_equivalence(run_dir, root)
-        if res is None:
-            print("context equivalence: skipped (needs data/documents.sqlite or a checkout, and contexts.jsonl.gz)")
-        else:
-            print(f"context equivalence: {res['reproduced']}/{res['checked']} published context hashes reproduced "
-                  f"from the retrieval order and the corpus ({res['backend']})")
-            ok = ok and res["reproduced"] == res["checked"]
-            if a.log:
-                with open(a.log, "w", encoding="utf-8") as f:
-                    json.dump(res, f, indent=1)
-                print(f"wrote {a.log}")
-    print("VERIFIED" if ok else "PROBLEMS FOUND")
-    return 0 if ok else 1
-
-
-def _context_equivalence(run_dir: Path, root: Path | None) -> dict | None:
-    """Rebuild every published context from the saved retrieval order and the
-    corpus, and compare sha256 with the checkpoint. Offline; no LLM, no HydraDB."""
-    from . import hydrate
-    ck_path, ctx_path = run_dir / "gen_checkpoint.json", run_dir / "contexts.jsonl.gz"
-    if not ck_path.exists() or not ctx_path.exists():
-        return None
-    db = paths.documents_db_path()
-    if not db.exists() and not (root and (root / "generated_data" / "uuid_index.json").exists()):
-        return None
-    try:
-        store = hydrate.DocumentStore(db if db.exists() else None, root)
-    except FileNotFoundError:
-        return None
-    cfg = RunConfig.load(run_dir / "config.yaml") if (run_dir / "config.yaml").exists() else RunConfig()
-    with open(ck_path, "r", encoding="utf-8") as f:
-        rows = [r for r in json.load(f) if "question_id" in r]
-    published: dict[str, str] = {}
-    with gzip.open(ctx_path, "rt", encoding="utf-8") as f:
-        for line in f:
-            c = json.loads(line)
-            published[c["question_id"]] = c["context_sha256"]
-    checked = reproduced = 0
-    mismatched: list[str] = []
-    for r in rows:
-        if r["question_id"] not in published:
-            continue
-        ctx = hydrate.build_context(r["retrieved_doc_ids"], [], store, cfg.generation.docs_in_context,
-                                    cfg.generation.max_context_chars)
-        checked += 1
-        if ctx["context_sha256"] == published[r["question_id"]] == r.get("context_sha256"):
-            reproduced += 1
-        else:
-            mismatched.append(r["question_id"])
-    return {"checked": checked, "reproduced": reproduced, "mismatched": mismatched, "backend": store.backend,
-            "docs_in_context": cfg.generation.docs_in_context, "max_context_chars": cfg.generation.max_context_chars,
-            "erb_commit": _checkout_commit(root) if root else None, "finished_at": manifest.now_iso()}
+        report["checks"]["pinned_checkout"] = {"status": "incomplete", "problems": ["no checkout present (run setup)"]}
+    report["ok"] = all(c["status"] == "ok" for n, c in report["checks"].items()
+                       if not (n == "pinned_checkout" and c["status"] == "incomplete"))
+    if a.contexts and report["checks"].get("context_reconstruction", {}).get("status") == "incomplete":
+        report["ok"] = False
+    print(validate.format_report(report))
+    if a.log:
+        with open(a.log, "w", encoding="utf-8") as f:
+            json.dump({**report, "run_dir": str(run_dir), "finished_at": manifest.now_iso()}, f, indent=1)
+        print(f"wrote {a.log}")
+    return 0 if report["ok"] else 1
 
 
 def cmd_stats(a: argparse.Namespace) -> int:
+    problems, _ = validate.check_results_file(Path(a.results), None)
     rc = analysis.recompute_stats(a.results)
     print(json.dumps(rc["recomputed"], indent=1))
-    if rc["diffs"]:
-        print(f"MISMATCH vs file: {rc['diffs']}")
+    if problems:
+        print("MISMATCH vs file:\n  " + "\n  ".join(problems[:10]))
         return 1
-    print(f"ok: n={rc['n']}, aggregates in the file match the recomputation")
+    print(f"ok: n={rc['n']}, every aggregate and per-category statistic in the file matches the recomputation")
+    return 0
+
+
+# ------------------------------------------------------- corrections audit --
+
+def cmd_audit_corrections(a: argparse.Namespace) -> int:
+    run_dir = Path(a.run_dir).resolve()
+    qpath = _questions(a.questions, True)
+    res_path = run_dir / "official_results_protocol.json"
+    corr_path = run_dir / "corrections.jsonl"
+    if not res_path.exists() or not corr_path.exists():
+        _die("needs official_results_protocol.json and corrections.jsonl in the run directory")
+    originals = {r["question_id"]: r for r in validate.read_jsonl_rows(qpath)}
+    results = {r["question_id"]: r for r in analysis.load_results(res_path)["questions"]}
+    records = validate.read_jsonl_rows(corr_path)
+    problems = validate.check_ids(records, None, "corrections")
+    by_id = {r["question_id"]: r for r in records}
+    flagged = {q for q, r in results.items() if r.get("corrected")}
+    for q in sorted(flagged - set(by_id)):
+        problems.append(f"{q} is flagged corrected but has no correction record")
+    for q in sorted(set(by_id) - flagged):
+        problems.append(f"{q} has a correction record but is not flagged corrected")
+    for q, rec in by_id.items():
+        o = originals.get(q)
+        if o is None:
+            problems.append(f"{q}: not in the questions file")
+            continue
+        before = rec.get("before", {})
+        if (before.get("expected_doc_ids") != o["expected_doc_ids"] or before.get("gold_answer") != o["gold_answer"]
+                or before.get("answer_facts") != o["answer_facts"]):
+            problems.append(f"{q}: 'before' does not equal the pinned original question")
+        after = rec.get("after", {})
+        if not after.get("expected_doc_ids") or not after.get("gold_answer") or not isinstance(after.get("answer_facts"), list):
+            problems.append(f"{q}: 'after' record incomplete")
+        if not rec.get("update_reasons"):
+            problems.append(f"{q}: no update_reasons")
+    summary = {
+        "flagged_corrected": len(flagged), "records": len(by_id),
+        "doc_set_changed": sum(1 for r in by_id.values() if r.get("doc_set_changed")),
+        "gold_answer_changed": sum(1 for r in by_id.values() if r.get("gold_answer_changed")),
+        "uncorrected_questions": len(results) - len(flagged),
+        "problems": problems, "ok": not problems, "finished_at": manifest.now_iso(),
+    }
+    print(json.dumps({k: v for k, v in summary.items() if k != "problems"}, indent=1))
+    for p in problems:
+        print("  - " + p)
+    if a.out:
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=1)
+        print(f"wrote {a.out}")
+    return 0 if not problems else 1
+
+
+# ---------------------------------------------------------------- inspect --
+
+def cmd_inspect(a: argparse.Namespace) -> int:
+    run_dir = Path(a.run_dir).resolve()
+    qid = a.question_id
+    q = {r["question_id"]: r for r in validate.read_jsonl_rows(_questions(a.questions, True))}.get(qid)
+    if q is None:
+        _die(f"{qid} not in the questions file")
+    out: dict = {"question": q}
+    ck = run_dir / "gen_checkpoint.json"
+    if ck.exists():
+        _, rows = validate.read_checkpoint(ck)
+        out["checkpoint"] = next((r for r in rows if r["question_id"] == qid), None)
+    ans = run_dir / "answers.jsonl"
+    if ans.exists():
+        out["answer"] = next((r for r in validate.read_jsonl_rows(ans) if r["question_id"] == qid), None)
+    for name in ("official_results_strict.json", "official_results_protocol.json"):
+        p = run_dir / name
+        if p.exists():
+            out[name] = next((r for r in analysis.load_results(p)["questions"] if r["question_id"] == qid), None)
+    corr = run_dir / "corrections.jsonl"
+    if corr.exists():
+        out["correction"] = next((r for r in validate.read_jsonl_rows(corr) if r["question_id"] == qid), None)
+    ctx = run_dir / "contexts.jsonl.gz"
+    if ctx.exists() and a.context:
+        out["context"] = next((r for r in validate.read_jsonl_rows(ctx) if r["question_id"] == qid), None)
+    if a.json:
+        print(json.dumps(out, indent=1, ensure_ascii=False))
+        return 0
+    print(f"# {qid} [{q['question_type']}] sources={q.get('source_types')}\n\nQ: {q['question']}\n")
+    print(f"gold answer: {q.get('gold_answer')}\ngold docs: {q.get('expected_doc_ids')}\n")
+    if out.get("checkpoint"):
+        c = out["checkpoint"]
+        print(f"retrieved (top {len(c.get('retrieved_doc_ids', []))}): {c.get('retrieved_doc_ids', [])[:10]} ...")
+        print(f"context docs: {c.get('context_docs')}  chars={c.get('context_chars')} sha={str(c.get('context_sha256'))[:12]}\n")
+    if out.get("answer"):
+        print(f"answer ({len(out['answer']['answer'])} chars):\n{out['answer']['answer']}\n")
+    for name in ("official_results_strict.json", "official_results_protocol.json"):
+        r = out.get(name)
+        if r:
+            print(f"{name}: correct={r['answer_correct']} completeness={r['completeness_pct']} recall={r.get('document_recall_pct')} "
+                  f"extra={r.get('invalid_extra_docs')} corrected={r.get('corrected')}\n  reasoning: {r.get('correctness_reasoning')}\n")
+    if out.get("correction"):
+        c = out["correction"]
+        print(f"correction: doc set changed={c.get('doc_set_changed')} gold answer changed={c.get('gold_answer_changed')}")
+        print(f"  before docs: {c['before']['expected_doc_ids']}\n  after docs:  {c['after']['expected_doc_ids']}")
+    if out.get("context"):
+        print("\n--- context ---\n" + out["context"]["context"])
     return 0
 
 
@@ -340,6 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="erb-hydradb", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    s = sub.add_parser("doctor"); s.set_defaults(fn=cmd_doctor)
     s = sub.add_parser("setup"); s.add_argument("--erb-dir"); s.set_defaults(fn=cmd_setup)
 
     s = sub.add_parser("download"); s.add_argument("--from-checkout", action="store_true")
@@ -347,22 +503,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("ingest"); s.add_argument("--config", required=True); s.add_argument("--run-dir", required=True)
     s.add_argument("--no-infer", action="store_true"); s.add_argument("--resume", action="store_true")
-    s.add_argument("--dry-run", action="store_true"); s.add_argument("--limit", type=int)
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--limit", type=int, help="documents to ingest; part of the resume identity (repeat it with --resume)")
     s.add_argument("--source-types", nargs="+"); s.add_argument("--batch-size", type=int, default=80)
     s.add_argument("--batch-sleep", type=float, default=1.0); s.add_argument("--no-provision", action="store_true")
-    s.add_argument("--no-wait", action="store_true"); s.set_defaults(fn=cmd_ingest)
+    s.add_argument("--no-wait", action="store_true",
+                   help="send without waiting for indexing status; the run ends INCOMPLETE (exit 2) until --resume reconciles it")
+    s.set_defaults(fn=cmd_ingest)
 
     s = sub.add_parser("generate"); s.add_argument("--config", required=True); s.add_argument("--run-dir", required=True)
     s.add_argument("--questions"); s.add_argument("--targets"); s.add_argument("--n", type=int)
     s.add_argument("--retrieval-only", action="store_true"); s.add_argument("--from-contexts")
     s.add_argument("--force-resume", action="store_true"); s.add_argument("--allow-unpinned", action="store_true")
+    s.add_argument("--allow-partial", action="store_true", help="exit 0 even if some questions failed")
     s.set_defaults(fn=cmd_generate)
 
     s = sub.add_parser("judge"); s.add_argument("--config", required=True); s.add_argument("--run-dir", required=True)
     s.add_argument("--protocol", choices=["strict", "official"], default="strict")
     s.add_argument("--answers"); s.add_argument("--results"); s.add_argument("--erb"); s.add_argument("--questions")
     s.add_argument("--question-id"); s.add_argument("--expect-n", type=int, default=None)
-    s.add_argument("--allow-unpinned", action="store_true"); s.set_defaults(fn=cmd_judge)
+    s.add_argument("--allow-unpinned", action="store_true")
+    s.add_argument("--fresh", action="store_true", help="official: archive previous shards and judge everything again")
+    s.set_defaults(fn=cmd_judge)
 
     s = sub.add_parser("report"); s.add_argument("--run-dir", required=True); s.add_argument("--title")
     s.add_argument("--questions"); s.add_argument("--leaderboard"); s.add_argument("--out"); s.set_defaults(fn=cmd_report)
@@ -376,10 +538,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--b", required=True); s.add_argument("--questions"); s.add_argument("--ctx", type=int, default=12)
     s.add_argument("--ids"); s.set_defaults(fn=cmd_recall)
 
-    s = sub.add_parser("verify"); s.add_argument("--run-dir", required=True)
+    s = sub.add_parser("verify"); s.add_argument("--run-dir", required=True); s.add_argument("--questions")
     s.add_argument("--contexts", action="store_true", help="also rebuild every context from the corpus and compare hashes")
-    s.add_argument("--log", help="write the context-equivalence result to this JSON file"); s.set_defaults(fn=cmd_verify)
+    s.add_argument("--minimal", action="store_true",
+                   help="partial run dir (pilot): do not require the published artifact set or full-set coverage")
+    s.add_argument("--log", help="write the full validation report to this JSON file"); s.set_defaults(fn=cmd_verify)
     s = sub.add_parser("stats"); s.add_argument("--results", required=True); s.set_defaults(fn=cmd_stats)
+
+    s = sub.add_parser("audit-corrections"); s.add_argument("--run-dir", required=True); s.add_argument("--questions")
+    s.add_argument("--out"); s.set_defaults(fn=cmd_audit_corrections)
+
+    s = sub.add_parser("inspect"); s.add_argument("--run-dir", required=True); s.add_argument("--question-id", required=True)
+    s.add_argument("--questions"); s.add_argument("--context", action="store_true", help="print the full context text")
+    s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_inspect)
     return p
 
 

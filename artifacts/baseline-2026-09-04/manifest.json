@@ -50,7 +50,8 @@
         "gen_checkpoint.json": "13c29c6f7ab995ce4f342623494467e787073449830294218c0ece31a7b39c45"
       },
       "produced_on": "2026-09-04",
-      "notes": "Earlier chunk-based pipeline (top-12 chunks to the generator, fast retrieval, up to 50 ids submitted). Kept only as the comparison baseline; its generator is not part of this package."
+      "notes": "Earlier chunk-based pipeline (top-12 chunks to the generator, fast retrieval, up to 50 ids submitted). Kept only as the comparison baseline; its generator is not part of this package.",
+      "retrospective": true
     }
   ]
 }

@@ -113,7 +113,8 @@ before judging, the strict setting does not.
 
 ## 5. Answer generation (GPT-5.4)
 
-Three calls per question with `openai/gpt-5.4` via OpenRouter, temperature 0,
+Three calls per question with `openai/gpt-5.4` via OpenRouter, temperature 0
+(requested explicitly for generation; the evaluator's judge calls set none),
 `max_tokens` 4000, prompts verbatim in `src/erb_hydradb/prompts.py`
 (version `two-pass-v1`):
 
@@ -135,15 +136,23 @@ so it can be judged.
 ## 6. Scoring (benchmark evaluator)
 
 `src/scripts/answer_evaluation/metrics_based_eval.py` from the pinned checkout,
-invoked as a subprocess from the checkout root. Two settings are reported:
+invoked as a subprocess. The harness runs it from its own copy of the
+checkout's `src/` tree (`data/evaluator/<provider>/`, with the corpus and
+questions linked in), so the user's checkout is never modified and the exact
+evaluator bytes used are hashed into the manifest. Two settings are reported:
 
 - **Strict**: `--no-correction --skip-citation-stripping`. The gold set is never
   changed, so runs are directly comparable to each other.
 - **Official protocol**: citation stripping and the three-judge document
   correction flow, which may add or remove gold documents and regenerate the gold
-  answer and facts for a question (14 of 500 in the published run). Run as 20
-  concurrent shards of 25 questions (the evaluator writes results only at the end
-  of a process) and merged with the evaluator's own `compute_stats_for_group`.
+  answer and facts for a question (14 of 500 in the published run; every
+  correction, with the before/after gold documents, gold answer, answer facts and
+  the judges' reasons, is published in `corrections.jsonl` and checked by
+  `erb-hydradb audit-corrections`). Run as 20 concurrent shards of 25 questions
+  for throughput and fault isolation (the evaluator supports `--resume`, which
+  retries use), and merged with the evaluator's own `compute_stats_for_group`.
+  The citation-stripped answer texts the judge actually scored were not retained
+  by the originating run.
 
 Judge model: GPT-5.4, the evaluator's default. The published run called it
 through OpenRouter chat completions (two files in the checkout replaced by
@@ -156,16 +165,22 @@ Per-question outputs: `answer_correct`, `completeness_pct`, `document_recall_pct
 mean over questions of (`completeness_pct` if `answer_correct` else 0).
 
 Known evaluator behaviour: if any single fact-validation call raises, the
-question's completeness is recorded as 0 with no marker. The published run has
-one such row (`qst_0242`, correct, 0 %); re-judging it gave 100 %. Published
+question's completeness is recorded as 0 with no marker, and the same row is
+produced when every fact is legitimately judged unsupported. The published run
+has one row judged correct with 0 % completeness (`qst_0242`); a separate
+re-judge of the same answer gave 100 %
+(`artifacts/run-2026-09-04/judge_audit/v3_rejudge_anomaly.json`). That shows
+instability on this question; it does not establish the cause. Published
 numbers are the unadjusted run.
 
-The evaluator's JSON-recovery helper calls a second, "cheap" model
-(`CHEAP_LLM_MODEL_NAME`, upstream default `gpt-5-mini`). The published run did
-not set it, so under the OpenRouter patch that fallback would not have resolved
-and a recovery call could fail; this harness sets it from `judge.cheap_model`
-(`openai/gpt-5-mini` under OpenRouter). A failed recovery is one way to reach
-the completeness-zero row above.
+The evaluator defines a second, "cheap" model (`CHEAP_LLM_MODEL_NAME`,
+upstream default `gpt-5-mini`) used by its JSON-recovery helper. The published
+run did not set it. Offline inspection of the pinned evaluator shows that the
+scoring paths used here (holistic correctness, fact validation, document
+evaluation, fact regeneration) do not call that helper, so this setting is not
+a plausible cause of the anomaly above. The harness still normalises it per
+provider (`judge.cheap_model`) so that any future evaluator path that does use
+it has a valid model id; the historical config records it as unset.
 
 Statistics outside the evaluator (`verify`, `stats`, `report`, `compare`) are
 computed by `analysis.py`, a reimplementation of the evaluator's
@@ -224,7 +239,18 @@ so that "88.73" can be read as what it is: one full run, not a best-of.
 
 The pilot subset (76 questions, stratified by category) was used only to choose
 the configuration; the 500-question run was then made once with it. The pilot
-questions are not held out from the 500.
+questions are not held out from the 500, so the final run is not a held-out
+estimate. The +24.07 paired improvement over the baseline is a comparison of two
+pipelines that differ in hydration, retrieval mode and submitted depth at once;
+its bootstrap interval is conditional on these two runs and says nothing about
+model drift, another rerun, or other systems.
+
+### Judge stability panel
+
+`artifacts/run-2026-09-04/judge_audit/`: 24 baseline answers (ids in
+`panel_ids.txt`, drawn with `random.seed(2026)`) judged a second time under the
+strict setting: 0 correctness flips, one completeness disagreement of 33 points
+on one question. This is a small panel; it characterises the judge only roughly.
 
 ### What HydraDB received
 

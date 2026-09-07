@@ -53,7 +53,7 @@ class JudgeConfig:
     provider: str = "openrouter"    # openrouter | openai
     # The evaluator's JSON-recovery path calls a second, "cheap" model
     # (upstream default gpt-5-mini). It must be a valid id for the provider.
-    cheap_model: str = "openai/gpt-5-mini"
+    cheap_model: str | None = "openai/gpt-5-mini"   # None = leave CHEAP_LLM_MODEL_NAME unset (as the published run did)
     strict_parallelism: int = 6     # threads in the single strict process
     shards: int = 20                # official protocol: concurrent processes
     shard_parallelism: int = 5      # threads per shard
@@ -89,7 +89,8 @@ class RunConfig:
     def generation_fingerprint(self) -> str:
         """sha256 over every field that changes what the generator produces."""
         relevant = {
-            "hydradb": {"database": self.hydradb.database, "collection": self.hydradb.collection},
+            "hydradb": {"base_url": self.hydradb.base_url, "database": self.hydradb.database,
+                        "collection": self.hydradb.collection},
             "retrieval": asdict(self.retrieval),
             "generation": {k: v for k, v in asdict(self.generation).items() if k != "workers"},
         }

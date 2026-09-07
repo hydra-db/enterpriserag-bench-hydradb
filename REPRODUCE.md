@@ -1,147 +1,208 @@
 # Reproducing the result
 
 Five levels, each independent of the ones above it. Pick the one that matches
-the keys and time you have. All commands assume the quick-start install from
-the README and a `.env` copied from `.env.example`.
+the keys and time you have. All commands assume the README install and, from
+level 1 up, a `.env` copied from `.env.example`. Run `erb-hydradb doctor` first:
+it checks the environment, which keys are present for which stage, the pinned
+benchmark files, the corpus, and the published contexts, without spending
+anything.
 
-| Level | What you reproduce | Needs | Time | Cost |
+| Level | What you reproduce | Needs | Time | Cost (planning figure) |
 |---|---|---|---|---|
-| 0 | The published statistics from the published per-question rows | nothing | 1 min | 0 |
-| 1 | The judge: re-score our published answers with the benchmark evaluator | an LLM key | 10–20 min | ~$8 strict, ~$60 official |
-| 2 | The generator: regenerate answers from the exact contexts our model saw, then judge | an LLM key | ~1 h | ~$150 + level 1 |
-| 3 | Retrieval: query HydraDB, hydrate, generate, judge | HydraDB key + LLM key + corpus | ~1.5 h | ~$200 |
-| 4 | Ingestion: load the corpus into a fresh HydraDB collection, then level 3 | as level 3 | hours | ingest cost + level 3 |
+| 0 | The published statistics and evidence, from the published files | nothing | 5 min | 0 |
+| 1 | The judge: re-score our published answers with the benchmark evaluator | LLM key + benchmark checkout | 10–20 min | ~$8 strict, ~$60 official |
+| 2 | The generator: regenerate answers from the exact contexts our model saw | LLM key | ~1 h | ~$150, plus level 1 to judge |
+| 3 | Retrieval: query HydraDB, hydrate, generate, judge | HydraDB key + LLM key + checkout | ~1.5 h | ~$200 |
+| 4 | Ingestion: load the corpus into your own HydraDB database, then level 3 | as level 3 | hours | ingest cost + level 3 |
 
-Costs are for GPT-5.4 via OpenRouter at September 2026 prices and are approximate.
+Costs are for GPT-5.4 via OpenRouter at September 2026 prices, approximate.
 
-## Level 0 — statistics from the published rows (no keys)
+Exit codes everywhere: `0` ok; `1` usage or input problem (nothing was spent);
+`2` the command ran but the run is incomplete or failed validation (the output
+says what; partial files are kept for inspection).
+
+## Level 0 — the published evidence (no keys)
 
 ```bash
 .venv/bin/python -m erb_hydradb verify --run-dir artifacts/run-2026-09-04
+.venv/bin/python -m erb_hydradb audit-corrections --run-dir artifacts/run-2026-09-04
 .venv/bin/python -m erb_hydradb report --run-dir artifacts/run-2026-09-04 \
-    --questions tests/data/questions.jsonl --leaderboard scripts/leaderboard-2026-08-28.json \
+    --leaderboard scripts/leaderboard-2026-08-28.json \
     --title "HydraDB on EnterpriseRAG-Bench: published run 2026-09-04" --out /tmp/RESULTS.md   # identical to the committed RESULTS.md
 .venv/bin/python -m erb_hydradb compare \
     --a artifacts/baseline-2026-09-04/official_results_strict.json --answers-a artifacts/baseline-2026-09-04/answers.jsonl \
     --b artifacts/run-2026-09-04/official_results_strict.json --checkpoint-b artifacts/run-2026-09-04/gen_checkpoint.json \
-    --questions tests/data/questions.jsonl --expect-n 500
+    --expect-n 500
+.venv/bin/python -m erb_hydradb inspect --run-dir artifacts/run-2026-09-04 --question-id qst_0224 --context
 ```
 
-Expected: `VERIFIED`; combined 88.73 (official) / 88.30 (strict); paired delta vs
-the baseline +24.07 with 95 % CI [20.27, 28.01]; flips F→T 124, T→F 10.
+`verify` enumerates what it checked: file integrity and manifest hashes, schema
+and unique ids of every artifact, exact coverage against the 500 questions,
+cross-file id equality, every aggregate and per-category statistic recomputed
+with the benchmark's formula, and the actual sha256 of every context. Expected:
+all `OK`, `VERIFIED`; combined 88.73 (official) / 88.30 (strict); audit 14/14
+`ok`; paired delta vs the baseline +24.07 with interval [20.27, 28.01]; flips
+F→T 124, T→F 10.
 
 With the benchmark checkout present (after `setup`), `verify --contexts` also
-rebuilds all 500 contexts the answer model saw from the saved retrieval order
-and the corpus and checks their sha256 against the published ones. Expected:
-500 of 500.
+rebuilds all 500 contexts from the saved retrieval order and the corpus and
+compares their sha256 against the published ones. Expected: 500 of 500; the
+published result of that check is `artifacts/run-2026-09-04/context_equivalence.json`.
 
-## Setup for levels 1 to 4
+## Setup for levels 1, 3 and 4
 
 ```bash
 .venv/bin/python -m erb_hydradb setup          # clones EnterpriseRAG-Bench at the pinned commit, verifies questions.jsonl
 echo "ERB_REPO=$PWD/EnterpriseRAG-Bench" >> .env
+.venv/bin/python -m erb_hydradb doctor
 ```
 
 The benchmark repository contains the corpus as 511,962 files: the clone is
-about 5 GB on disk and takes a few minutes. (`--filter=blob:none` keeps history
-small; the working tree is still fully materialised.)
+about 5 GB on disk and takes a few minutes. Level 2 does not need it.
 
-Judge provider: set `judge.provider` in the config (or copy the config and edit).
+Judge provider, set in the config:
 
-- `openrouter` (what we used): needs `OPENROUTER_API_KEY`; two files in the checkout
-  are replaced by `src/erb_hydradb/erb_patches/` so the judge is called through
-  OpenRouter chat completions. `erb-hydradb judge` applies and records this.
+- `openrouter` (what we used): needs `OPENROUTER_API_KEY`. The evaluator is run
+  from a harness-owned copy of its `src/` tree with two files replaced
+  (`src/erb_hydradb/erb_patches/`) so the judge is called through OpenRouter chat
+  completions. Your checkout is never modified.
 - `openai`: needs `OPENAI_API_KEY`; the evaluator runs unmodified (Responses API,
-  reasoning effort medium). Set `judge.model: gpt-5.4`. This is the maintainers'
-  exact path.
+  reasoning effort medium). Set `judge.model: gpt-5.4` and
+  `judge.cheap_model: gpt-5-mini`. This is the maintainers' exact path.
 
 ## Level 1 — re-judge our published answers
 
 ```bash
 R=data/runs/rejudge
 .venv/bin/python -m erb_hydradb judge --config config/run-2026-09-04.yaml --run-dir $R \
-    --protocol strict   --answers artifacts/run-2026-09-04/answers.jsonl
+    --protocol strict   --answers artifacts/run-2026-09-04/answers.jsonl --expect-n 500
 .venv/bin/python -m erb_hydradb judge --config config/run-2026-09-04.yaml --run-dir $R \
     --protocol official --answers artifacts/run-2026-09-04/answers.jsonl --expect-n 500
 .venv/bin/python -m erb_hydradb compare --a artifacts/run-2026-09-04/official_results_strict.json \
-    --b $R/official_results_strict.json --questions data/questions.jsonl --expect-n 500
+    --b $R/official_results_strict.json --expect-n 500
 ```
 
-Expected tolerance: combined within about ±1.0 of 88.30 (strict) and 88.73
-(official); correctness flips in the low single digits; the official protocol's
-corrected-question count near 14. A row with `answer_correct: true` and
-`completeness_pct: 0` is the evaluator's known failure mode (a single
-fact-validation call failed); re-judge that question alone with
-`--protocol strict --question-id qst_XXXX --results <separate file>`.
+Planning expectation, not a bound: combined within about ±1 of 88.30 (strict) and
+88.73 (official); a handful of correctness flips; the official protocol's
+corrected-question count near 14. Our own 24-question repeat-judge panel is in
+`artifacts/run-2026-09-04/judge_audit/` (ids in `panel_ids.txt`; selected with
+`random.seed(2026)` over the baseline answers): 0 correctness flips, one
+completeness disagreement.
+
+A row with `answer_correct: true` and `completeness_pct: 0` is an anomaly worth
+re-checking: re-judge that question alone with
+`--protocol strict --question-id qst_XXXX --results <separate file>` and report
+both outcomes. Do not overwrite the original.
+
+Retries: the official protocol runs as 20 shards. If some fail, re-run the same
+command; completed shards are kept and only the missing ones are judged. Use
+`--fresh` only to deliberately judge everything again (the previous shard
+directory is archived, not deleted).
 
 ## Level 2 — regenerate answers from our saved contexts
 
-This exercises the answer-generation stage with an LLM key only: the exact
-documents our model saw are in `contexts.jsonl.gz`.
+The exact documents our model saw are in `contexts.jsonl.gz`. No checkout, no
+HydraDB key. The file is validated before any model call (schema, unique ids,
+coverage of the requested questions, the actual sha256 of every context, its
+declared length, absence of benchmark markers); a bad file fails with exit 1 and
+costs nothing.
 
 ```bash
 R=data/runs/regen
 .venv/bin/python -m erb_hydradb generate --config config/run-2026-09-04.yaml --run-dir $R \
     --from-contexts artifacts/run-2026-09-04/contexts.jsonl.gz
-.venv/bin/python -m erb_hydradb judge --config config/run-2026-09-04.yaml --run-dir $R --protocol strict
 ```
 
-Expected: combined within about ±2 of 88.30 (two sources of variance now: the
-generator and the judge). Document ids are taken from the saved retrieval order,
-so recall is identical to the published run by construction.
+Then level 1 on `$R/answers.jsonl` to judge. Document ids come from the saved
+retrieval order, so recall is identical to the published run by construction.
+Planning expectation: combined within about ±2 of 88.30 (generator and judge
+variance now both apply).
+
+If some questions fail (provider errors), the command exits 2 and writes the
+partial `answers.jsonl`; re-running the same command retries only the failed
+rows. `--allow-partial` accepts an incomplete run with exit 0 (recorded in the
+manifest as `complete: false`).
 
 ## Level 3 — retrieval against HydraDB
 
-Needs `HYDRADB_API_KEY` with access to the database named in the config, and a
-document store for hydration: either `erb-hydradb download --from-checkout` (builds
-`data/documents.sqlite` from the clone in a few minutes, no Hugging Face needed) or
-the checkout itself (used automatically as a fallback).
+Needs `HYDRADB_API_KEY` with access to the database named in the config, the
+checkout (for hydration and judging), and optionally `data/documents.sqlite`
+(`download --from-checkout`, a few minutes, no Hugging Face needed; the checkout
+is used directly otherwise).
 
 For verification by the benchmark authors we provide a read-only key to the
-published collection on request; anyone else needs level 4 first.
+published collection on request. Anyone else needs level 4 first, with their
+own database in a copy of `config/my-run.example.yaml`.
 
 ```bash
 .venv/bin/python -m erb_hydradb download --from-checkout
 R=data/runs/full
 .venv/bin/python -m erb_hydradb generate --config config/run-2026-09-04.yaml --run-dir $R
-.venv/bin/python -m erb_hydradb judge --config config/run-2026-09-04.yaml --run-dir $R --protocol strict
+.venv/bin/python -m erb_hydradb judge --config config/run-2026-09-04.yaml --run-dir $R --protocol strict   --expect-n 500
 .venv/bin/python -m erb_hydradb judge --config config/run-2026-09-04.yaml --run-dir $R --protocol official --expect-n 500
-.venv/bin/python -m erb_hydradb report --run-dir $R --questions data/questions.jsonl
-.venv/bin/python -m erb_hydradb recall --a artifacts/run-2026-09-04/gen_checkpoint.json --b $R/gen_checkpoint.json --questions data/questions.jsonl
+.venv/bin/python -m erb_hydradb verify --run-dir $R --contexts
+.venv/bin/python -m erb_hydradb report --run-dir $R
+.venv/bin/python -m erb_hydradb recall --a artifacts/run-2026-09-04/gen_checkpoint.json --b $R/gen_checkpoint.json
 ```
 
-Useful variants: `--targets ids.txt` or `--n 50` for a pilot; `--retrieval-only`
-to measure recall without any LLM cost (see `recall`); a copy of the config with
-`retrieval.mode: fast` for the fast/thinking ablation (checkpoints refuse to
-resume under a changed config, so use a new run directory).
+Variants: `--targets ids.txt` or `--n 50` for a pilot; `--retrieval-only` to
+measure recall with no LLM cost (then `recall`); a copy of the config with
+`retrieval.mode: fast` for the fast/thinking ablation. A run directory is bound
+to its configuration, questions file and (for replay) contexts file; resuming
+under a different one is refused, so use a new directory per variant. A
+retrieval-only run can be continued into generation in the same directory: the
+saved retrieval is reused and only the answers are generated.
 
-Expected: retrieval is deterministic in fast mode (identical top-50 on re-query);
-thinking mode varies slightly (recall@10 within about ±1 point). Combined score
-within about ±2 of the published numbers.
+Planning expectation: fast-mode retrieval re-queries identically; thinking mode
+varies slightly (recall@10 within about ±1 point); combined within about ±2.
 
 ## Level 4 — ingest the corpus
 
 ```bash
-.venv/bin/python -m erb_hydradb download --from-checkout            # or: pip install '.[corpus]' and omit the flag for Hugging Face
+cp config/my-run.example.yaml config/my-run.yaml     # edit hydradb.database / collection
+.venv/bin/python -m erb_hydradb download --from-checkout
 .venv/bin/python -m erb_hydradb ingest --config config/my-run.yaml --run-dir data/runs/ingest \
-    --batch-size 80 --batch-sleep 1.0            # --resume to continue after an interruption; --dry-run to test conversion
+    --batch-size 80 --batch-sleep 1.0            # --dry-run first to exercise conversion without API calls
 ```
 
-`config/my-run.yaml` should name a database you own and a fresh collection. The
-published run ingested with inference on (`--no-infer` turns it off). The command
-converts documents one at a time, sends batches, waits for indexing status per
-batch, and writes `ingest_manifest.json` with settled / errored / pending counts.
-Query only after the manifest shows no pending ids. Then run level 3 against the
-new collection.
+The command converts documents one at a time, journals every batch before it is
+sent, waits for HydraDB's indexing status per batch, and writes
+`ingest_manifest.json` with sent / settled / errored / pending counts and a
+`ready` flag that is true only when every sent item has a terminal status. It
+exits 2 if anything is outstanding; `--resume` reconciles outstanding items
+(re-sends a batch that was interrupted before acknowledgement; ids are
+deterministic and ingestion is upsert, so this is safe) before continuing. Query
+only when `ready` is true. Then level 3 against the new collection with the same
+config file.
+
+## Troubleshooting
+
+| Symptom | Meaning | What to do |
+|---|---|---|
+| `doctor` says a key is not set | that stage will refuse to start | add it to `.env`; keys are never printed |
+| `checkout ... is at X, not the pinned ...` | wrong benchmark revision | `erb-hydradb setup`, or `--allow-unpinned` (recorded; results not comparable) |
+| `questions.jsonl sha256 ... does not match` | wrong questions file | same as above |
+| `published contexts rejected` | the contexts file is malformed or incomplete | nothing was spent; check the listed problems |
+| `Refusing to resume ...: different run identity` | config, questions or contexts changed | new `--run-dir` (or `--force-resume`, recorded) |
+| HTTP 401 / 403 | bad key or no access to that database | check `.env` and the database name |
+| HTTP 429 | rate limit | the client backs off and retries; slow batches with `--batch-sleep` |
+| timeouts / connection errors | transient | safe to re-run every command; generate/ingest/judge resume |
+| `INCOMPLETE` (exit 2) | some questions or items failed | re-run to retry failures; inspect `manifest.json` |
+| `JUDGE FAILED: shards failed` | some evaluator shards died | re-run the same command; completed shards are kept |
+| `PROBLEMS FOUND` from `verify` | an artifact is inconsistent | the report names the check and the ids |
+
+Where things are: every run directory has `manifest.json` (one record per
+stage, with hashes of what it wrote), `SHA256SUMS`, and for judging
+`protocol_shards/log_*.attempt*.txt`. To report a problem, attach the manifest
+and the output of `verify --run-dir <dir> --minimal`.
 
 ## What can and cannot vary
 
-- **Retrieval order** is what HydraDB returned; it is saved per question (top 50)
-  so recall at any depth can be recomputed and two runs compared with `recall`.
+- **Retrieval order** is what HydraDB returned; it is saved per question (top 50).
 - **Contexts** are a pure function of the retrieval order and the corpus; the
   sha256 in the checkpoint lets you check that a regenerated context is
   byte-identical to the published one.
 - **Answers** vary with the model even at temperature 0.
 - **Judgments** vary with the judge; the official protocol can also change the gold
-  set for a few questions (14 in our run), which is why both protocols are
-  reported.
+  set for a few questions (14 in our run, published in `corrections.jsonl`), which
+  is why both protocols are reported.

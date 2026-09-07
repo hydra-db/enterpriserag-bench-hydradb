@@ -35,6 +35,23 @@ def git_commit() -> str | None:
         return None
 
 
+def actual_upstream() -> dict:
+    """What is actually on disk, as opposed to what is pinned."""
+    out: dict = {"erb_commit": None, "erb_src_dirty": None, "questions_sha256": None}
+    root = paths.erb_repo()
+    if root and (root / "questions.jsonl").exists():
+        try:
+            out["erb_commit"] = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True,
+                                               text=True, check=True).stdout.strip()
+            dirty = subprocess.run(["git", "status", "--porcelain", "--", "src"], cwd=root, capture_output=True,
+                                   text=True, check=True).stdout.strip()
+            out["erb_src_dirty"] = [line[3:] for line in dirty.splitlines()] if dirty else []
+        except Exception:  # noqa: BLE001
+            pass
+        out["questions_sha256"] = sha256_file(root / "questions.jsonl")
+    return out
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -55,7 +72,8 @@ def write_manifest(run_dir: str | Path, stage: str, config: dict | None, files: 
         "erb_hydradb_version": __version__,
         "repo_commit": git_commit(),
         "python": platform.python_version(),
-        "upstream": {"erb_commit": paths.ERB_COMMIT, "questions_sha256": paths.QUESTIONS_SHA256},
+        "upstream_pinned": {"erb_commit": paths.ERB_COMMIT, "questions_sha256": paths.QUESTIONS_SHA256},
+        "upstream_actual": actual_upstream(),
         "config": config,
         "files": {str(Path(p).relative_to(run_dir)): sha256_file(p) for p in files if Path(p).exists()},
     }

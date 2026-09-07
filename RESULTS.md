@@ -57,6 +57,27 @@ n = 500 questions; recomputation matches the file
 
 Questions with every gold document inside the top 10: 441 of 470.
 
+## Gold corrections applied by the official protocol
+
+14 questions had their gold set changed by the evaluator's three-judge correction step before scoring; each record in `corrections.jsonl` holds the pinned original and the corrected gold documents, gold answer and answer facts, with the judges' reasons. Document set changed: 14; gold answer changed: 14. Check with `erb-hydradb audit-corrections`.
+
+| Question | Type | Gold docs before | Gold docs after |
+|---|---|---|---|
+| qst_0176 | semantic | 1 | 1 |
+| qst_0354 | project_related | 8 | 9 |
+| qst_0364 | project_related | 3 | 2 |
+| qst_0411 | conflicting_info | 2 | 1 |
+| qst_0416 | conflicting_info | 2 | 1 |
+| qst_0420 | conflicting_info | 2 | 1 |
+| qst_0421 | conflicting_info | 2 | 1 |
+| qst_0423 | conflicting_info | 2 | 1 |
+| qst_0424 | conflicting_info | 2 | 1 |
+| qst_0426 | conflicting_info | 2 | 1 |
+| qst_0427 | conflicting_info | 2 | 1 |
+| qst_0429 | conflicting_info | 2 | 1 |
+| qst_0430 | conflicting_info | 2 | 1 |
+| qst_0439 | completeness | 5 | 3 |
+
 ## Public leaderboard at the time of the run
 
 Source: https://huggingface.co/spaces/onyx-dot-app/EnterpriseRAG-Bench-Leaderboard (2026-08-28).
