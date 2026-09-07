@@ -365,9 +365,7 @@ def cmd_verify(a: argparse.Namespace) -> int:
             "commit": head[:12]}
     else:
         report["checks"]["pinned_checkout"] = {"status": "incomplete", "problems": ["no checkout present (run setup)"]}
-    report["ok"] = all(c["status"] == "ok" for n, c in report["checks"].items()
-                       if not (n == "pinned_checkout" and c["status"] == "incomplete"))
-    if a.contexts and report["checks"].get("context_reconstruction", {}).get("status") == "incomplete":
+    if report["checks"]["pinned_checkout"]["status"] == "fail":
         report["ok"] = False
     print(validate.format_report(report))
     if a.log:

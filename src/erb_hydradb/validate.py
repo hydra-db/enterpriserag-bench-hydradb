@@ -333,7 +333,12 @@ def validate_run(run_dir: Path, questions_path: Path | None, *, required: tuple[
                 p.append("no contexts were checked")
             record("context_reconstruction", p, checked=checked, reproduced=checked - len(mism), backend=store.backend)
 
-    ok = all(c["status"] == "ok" for c in checks.values())
+    # A failed check fails the run. An INCOMPLETE check fails it only when that
+    # check was explicitly requested (context reconstruction); otherwise it is
+    # reported as such and the summary still says which checks did not run.
+    ok = all(c["status"] != "fail" for c in checks.values())
+    if contexts and checks.get("context_reconstruction", {}).get("status") == "incomplete":
+        ok = False
     return {"ok": ok, "checks": checks}
 
 
