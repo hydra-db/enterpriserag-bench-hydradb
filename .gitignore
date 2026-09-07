@@ -1,0 +1,16 @@
+# secrets
+.env
+.env.*
+!.env.example
+# local data and runs (large; rebuilt by `erb-hydradb download` / produced by runs)
+data/
+EnterpriseRAG-Bench/
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/

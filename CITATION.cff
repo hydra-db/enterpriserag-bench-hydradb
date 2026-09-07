@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use this harness or these results, please cite both this repository and the benchmark."
+title: "HydraDB on EnterpriseRAG-Bench: reproducible evaluation harness and results"
+authors:
+  - name: "HydraDB"
+version: 1.0.0
+date-released: 2026-09-07
+license: MIT
+repository-code: "https://github.com/hydra-db/enterpriserag-bench-hydradb"
+references:
+  - type: article
+    title: "EnterpriseRAG-Bench: A RAG Benchmark for Company Internal Knowledge"
+    authors:
+      - family-names: Sun
+        given-names: Yuhong
+      - family-names: Rahmfeld
+        given-names: Joachim
+      - family-names: Weaver
+        given-names: Chris
+      - family-names: Desai
+        given-names: Roshan
+      - family-names: Huang
+        given-names: Wenxi
+      - family-names: Butler
+        given-names: Mark H.
+    year: 2026
+    identifiers:
+      - type: other
+        value: "arXiv:2605.05253"
+    url: "https://arxiv.org/abs/2605.05253"

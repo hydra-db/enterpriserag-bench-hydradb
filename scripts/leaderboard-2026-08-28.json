@@ -1,0 +1,18 @@
+{
+  "source": "https://huggingface.co/spaces/onyx-dot-app/EnterpriseRAG-Bench-Leaderboard",
+  "date": "2026-08-28",
+  "total_systems": 22,
+  "note": "Snapshot of the public leaderboard's top 10 as displayed on the date above. Values are the leaderboard's own; re-check before quoting.",
+  "rows": [
+    {"rank": 1, "system": "metor.com", "overall": 80.34, "correctness": 82.0, "completeness": 86.22, "recall": 85.53, "invalid_extra": 4.96},
+    {"rank": 2, "system": "CDL (Causal Dynamics Lab)", "overall": 78.95, "correctness": 82.0, "completeness": 85.16, "recall": 80.54, "invalid_extra": 14.08},
+    {"rank": 3, "system": "Troml", "overall": 76.79, "correctness": 83.8, "completeness": 81.84, "recall": 86.55, "invalid_extra": 12.65},
+    {"rank": 4, "system": "Skyller", "overall": 71.93, "correctness": 77.0, "completeness": 79.14, "recall": 81.6, "invalid_extra": 8.86},
+    {"rank": 5, "system": "OpenClaw", "overall": 68.22, "correctness": 81.6, "completeness": 72.86, "recall": 79.02, "invalid_extra": 0.47},
+    {"rank": 6, "system": "SovraRAG.ch", "overall": 65.61, "correctness": 74.6, "completeness": 72.37, "recall": 78.8, "invalid_extra": 8.87},
+    {"rank": 7, "system": "fgroo", "overall": 63.27, "correctness": 71.0, "completeness": 71.03, "recall": 72.5, "invalid_extra": 0.63},
+    {"rank": 8, "system": "OpenAI File Search", "overall": 61.03, "correctness": 69.8, "completeness": 67.87, "recall": 71.65, "invalid_extra": 15.7},
+    {"rank": 9, "system": "RAGFlow", "overall": 50.24, "correctness": 56.0, "completeness": 58.74, "recall": 63.05, "invalid_extra": 4.61},
+    {"rank": 10, "system": "Amazon Q (Kendra)", "overall": 48.96, "correctness": 55.4, "completeness": 60.65, "recall": 70.38, "invalid_extra": 1.49}
+  ]
+}

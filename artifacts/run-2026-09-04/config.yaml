@@ -1,0 +1,35 @@
+# Exact configuration of the published run (artifacts/run-2026-09-04).
+# Any change to hydradb.database/collection, retrieval.*, or generation.* (except
+# workers) changes the generation fingerprint and therefore the run.
+name: run-2026-09-04
+
+hydradb:
+  base_url: https://api.hydradb.com
+  database: erb_appsources
+  collection: entire
+
+retrieval:
+  mode: thinking          # fast | thinking
+  alpha: 0.5
+  max_results: 100
+  query_by: hybrid
+  query_apps: false
+
+generation:
+  model: openai/gpt-5.4   # via OpenRouter; use "gpt-5.4" with provider: openai
+  provider: openrouter
+  max_tokens: 4000
+  temperature: 0.0
+  docs_in_context: 12
+  submit_docs: 10
+  max_context_chars: 240000
+  correction_loop: true
+  prompts_version: two-pass-v1
+  hydration: canonical-v2
+  workers: 6
+
+judge:
+  model: openai/gpt-5.4
+  provider: openrouter
+  parallelism: 5
+  shards: 20

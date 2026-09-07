@@ -1,0 +1,60 @@
+{
+  "stages": [
+    {
+      "stage": "published",
+      "finished_at": "2026-09-07T14:26:40+00:00",
+      "erb_hydradb_version": "1.0.0",
+      "repo_commit": null,
+      "python": "3.11.16",
+      "upstream": {
+        "erb_commit": "d36685e273713975ee20299bbf1ab64165575b3c",
+        "questions_sha256": "f9524b9157cd43aae36b99333a124738804306ea6d07f332d49faa6d3d147905"
+      },
+      "config": {
+        "name": "run-2026-09-04",
+        "hydradb": {
+          "base_url": "https://api.hydradb.com",
+          "database": "erb_appsources",
+          "collection": "entire"
+        },
+        "retrieval": {
+          "mode": "thinking",
+          "alpha": 0.5,
+          "max_results": 100,
+          "query_by": "hybrid",
+          "query_apps": false
+        },
+        "generation": {
+          "model": "openai/gpt-5.4",
+          "provider": "openrouter",
+          "max_tokens": 4000,
+          "temperature": 0.0,
+          "docs_in_context": 12,
+          "submit_docs": 10,
+          "max_context_chars": 240000,
+          "correction_loop": true,
+          "prompts_version": "two-pass-v1",
+          "hydration": "canonical-v2",
+          "workers": 6
+        },
+        "judge": {
+          "model": "openai/gpt-5.4",
+          "provider": "openrouter",
+          "parallelism": 5,
+          "shards": 20
+        }
+      },
+      "files": {
+        "answers.jsonl": "b0682b2178b9bdf7b6f0a771ef5fb3a6eacebacd5a36800c0d282d746433742c",
+        "official_results_strict.json": "9a336ccc51a74c5553b217dd75e6e0ed3f8face3fabb2489e213daadae3b4500",
+        "official_results_protocol.json": "8fae7677627a0173f1c73e037c38b363cb6c1b2e9ac2afdcb500731762302a23",
+        "gen_checkpoint.json": "6f1abe6a2f51f7e71105b7e0735065d4187d890b12e0450410f0cf8538c62c25",
+        "contexts.jsonl.gz": "2a213a99cadf062c8e3cca05b5234cf585de6acd0c2d61d68aa282f8759b5d7a",
+        "config.yaml": "a137e8b6ba7813ba8f0e9c1bf24241fb870ae99ac68767c70e577bf071828b8e"
+      },
+      "produced_on": "2026-09-04",
+      "notes": "Artifacts of the published run. generate: 500/500 questions, 0 errors, 0 dropped docs; judge strict: single process, parallelism 6; judge official: 20 shards x 5 workers, 14 corrected questions. Judge routed via OpenRouter (chat completions).",
+      "generation_fingerprint": "23ed626ddbc0f556a2057fc05b4bd80227488fdb3ac0f2f412dfdb42f683a0ee"
+    }
+  ]
+}
