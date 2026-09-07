@@ -3,7 +3,7 @@
 .env.*
 !.env.example
 # local data and runs (large; rebuilt by `erb-hydradb download` / produced by runs)
-data/
+/data/
 EnterpriseRAG-Bench/
 # python
 .venv/
