@@ -256,9 +256,14 @@ def render_results_md(run_dir: str | Path, questions_path: str | Path, title: st
                 f"| **{a['combined_correctness_completeness_score']}** | {a['average_correctness_pct']} % | "
                 f"{a['average_completeness_pct']} % | {a['average_recall_pct']} % | {a['average_invalid_extra_docs']} |",
                 "", "| Category | n | Combined | Correctness | Completeness | Recall |", "|---|---|---|---|---|---|"]
+        by_t = defaultdict(list)
+        for r in load_results(p)["questions"]:
+            by_t[r["question_type"]].append(r)
         for t, s in sorted(rc["recomputed"]["question_type_stats"].items(), key=lambda kv: -kv[1]["count"]):
+            has_gold = any(r.get("document_recall_pct") is not None for r in by_t[t])
+            recall = f"{s['average_recall_pct']} %" if has_gold else "n/a (no gold documents)"
             out.append(f"| {t} | {s['count']} | {s['combined_correctness_completeness_score']} | "
-                       f"{s['average_correctness_pct']} % | {s['average_completeness_pct']} % | {s['average_recall_pct']} % |")
+                       f"{s['average_correctness_pct']} % | {s['average_completeness_pct']} % | {recall} |")
         out.append("")
     ranked, source = load_retrieval(run_dir / "gen_checkpoint.json", run_dir / "answers.jsonl")
     if ranked:

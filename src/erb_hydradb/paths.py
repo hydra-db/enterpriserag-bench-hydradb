@@ -25,7 +25,12 @@ HF_SPLIT = "test"
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    """The checkout this package was installed from (editable install). Falls
+    back to the current directory when installed as a wheel."""
+    candidate = Path(__file__).resolve().parents[2]
+    if (candidate / "pyproject.toml").exists():
+        return candidate
+    return Path.cwd()
 
 
 def data_dir() -> Path:

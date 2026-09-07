@@ -37,17 +37,40 @@ def _die(msg: str) -> None:
     sys.exit(1)
 
 
-def _erb_root(arg: str | None) -> Path:
+def _checkout_commit(root: Path) -> str:
+    out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def _erb_root(arg: str | None, allow_unpinned: bool = False) -> Path:
+    """The benchmark checkout. Refuses a checkout that is not at the pinned
+    commit unless --allow-unpinned is given (and then says so loudly)."""
     root = Path(arg).expanduser().resolve() if arg else paths.erb_repo()
     if not root or not (root / "questions.jsonl").exists():
         _die("EnterpriseRAG-Bench checkout not found; run `erb-hydradb setup` or set ERB_REPO")
+    head = _checkout_commit(root)
+    if head != paths.ERB_COMMIT:
+        msg = f"checkout {root} is at {head[:12]}, not the pinned {paths.ERB_COMMIT[:12]}"
+        if not allow_unpinned:
+            _die(msg + " (run `erb-hydradb setup`, or pass --allow-unpinned to proceed anyway)")
+        print(f"WARNING: {msg}; results will not be comparable to the published run", file=sys.stderr)
     return root
 
 
-def _questions(arg: str | None) -> Path:
-    p = Path(arg).expanduser().resolve() if arg else paths.questions_path()
-    if not p.exists():
+def _questions(arg: str | None, allow_unpinned: bool = False) -> Path:
+    """The official questions file: --questions, else data/questions.jsonl (from
+    setup), else the copy shipped in tests/data. Its sha256 must match the pin."""
+    candidates = [Path(arg).expanduser().resolve()] if arg else [paths.questions_path(),
+                                                                  paths.repo_root() / "tests" / "data" / "questions.jsonl"]
+    p = next((c for c in candidates if c.exists()), None)
+    if p is None:
         _die("questions.jsonl not found; run `erb-hydradb setup`")
+    digest = _sha(p)
+    if digest != paths.QUESTIONS_SHA256:
+        msg = f"{p} sha256 {digest[:12]}... does not match the pinned questions file"
+        if not allow_unpinned:
+            _die(msg + " (pass --allow-unpinned to proceed anyway)")
+        print(f"WARNING: {msg}", file=sys.stderr)
     return p
 
 
@@ -117,7 +140,8 @@ def cmd_generate(a: argparse.Namespace) -> int:
     run_dir = Path(a.run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     cfg.save(run_dir / "config.yaml")
-    questions = generate.select_questions(generate.load_questions(_questions(a.questions)), a.targets, a.n)
+    questions = generate.select_questions(generate.load_questions(_questions(a.questions, a.allow_unpinned)),
+                                          a.targets, a.n)
     if not a.retrieval_only and not llm.provider_available(cfg.generation.provider):
         _die(f"no key for generation provider {cfg.generation.provider!r}")
     from_contexts = None
@@ -131,7 +155,10 @@ def cmd_generate(a: argparse.Namespace) -> int:
             src = plain
         from_contexts = src
     else:
-        store = hydrate.DocumentStore(paths.documents_db_path(), paths.erb_repo())
+        erb = paths.erb_repo()
+        if erb and not paths.documents_db_path().exists():
+            _erb_root(str(erb), a.allow_unpinned)   # enforce the pin when hydrating from the checkout
+        store = hydrate.DocumentStore(paths.documents_db_path(), erb)
         print(f"document store: {store.backend}")
     asyncio.run(generate.run_generate(cfg, run_dir, questions, api_key=os.environ.get("HYDRADB_API_KEY"),
                                       store=store, retrieval_only=a.retrieval_only, from_contexts=from_contexts,
@@ -149,8 +176,8 @@ def cmd_judge(a: argparse.Namespace) -> int:
     answers = Path(a.answers).resolve() if a.answers else run_dir / "answers.jsonl"
     if not answers.exists():
         _die(f"answers file not found: {answers}")
-    root = _erb_root(a.erb)
-    q = _questions(a.questions)
+    root = _erb_root(a.erb, a.allow_unpinned)
+    q = _questions(a.questions, a.allow_unpinned)
     results = Path(a.results).resolve() if a.results else None
     if a.protocol == "strict":
         out = judge.run_strict(cfg, run_dir, root, q, answers, results, question_id=a.question_id)
@@ -177,7 +204,8 @@ def cmd_report(a: argparse.Namespace) -> int:
     if a.leaderboard:
         with open(a.leaderboard, "r", encoding="utf-8") as f:
             lb = json.load(f)
-    md = analysis.render_results_md(run_dir, _questions(a.questions), a.title or f"Results: {run_dir.name}", lb)
+    title = a.title or f"HydraDB on EnterpriseRAG-Bench: {run_dir.name}"
+    md = analysis.render_results_md(run_dir, _questions(a.questions, True), title, lb)
     out = Path(a.out) if a.out else run_dir / "RESULTS.md"
     out.write_text(md, encoding="utf-8")
     print(f"wrote {out}")
@@ -187,7 +215,7 @@ def cmd_report(a: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- compare --
 
 def cmd_compare(a: argparse.Namespace) -> int:
-    rep = analysis.compare(a.a, a.b, _questions(a.questions), ids_file=a.ids, expect_n=a.expect_n,
+    rep = analysis.compare(a.a, a.b, _questions(a.questions, True), ids_file=a.ids, expect_n=a.expect_n,
                            a_checkpoint=a.checkpoint_a, a_answers=a.answers_a,
                            b_checkpoint=a.checkpoint_b, b_answers=a.answers_b)
     analysis.print_compare(rep)
@@ -201,7 +229,7 @@ def cmd_compare(a: argparse.Namespace) -> int:
 def cmd_recall(a: argparse.Namespace) -> int:
     ra, sa = analysis.load_retrieval(a.a, None)
     rb, sb = analysis.load_retrieval(a.b, None)
-    rep = analysis.recall_compare(ra, rb, _questions(a.questions), ctx=a.ctx, ids_file=a.ids)
+    rep = analysis.recall_compare(ra, rb, _questions(a.questions, True), ctx=a.ctx, ids_file=a.ids)
     print(f"n={rep['n']} questions with gold docs in both runs (A: {sa}; B: {sb})")
     print(f"  {'k':>4} {'A':>8} {'B':>8} {'delta':>8} {'95% CI':>18}")
     for r in rep["rows"]:
@@ -234,15 +262,66 @@ def cmd_verify(a: argparse.Namespace) -> int:
                   f"recall={agg['average_recall_pct']} -> {status}")
     root = paths.erb_repo()
     if root and (root / "questions.jsonl").exists():
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
+        head = _checkout_commit(root)
         qh = _sha(root / "questions.jsonl")
         print(f"checkout commit: {head[:12]} ({'ok' if head == paths.ERB_COMMIT else 'DIFFERS from pinned ' + paths.ERB_COMMIT[:12]})")
         print(f"questions.jsonl sha256: {'ok' if qh == paths.QUESTIONS_SHA256 else 'DIFFERS'}")
         ok = ok and head == paths.ERB_COMMIT and qh == paths.QUESTIONS_SHA256
     else:
         print("checkout: not present (run `erb-hydradb setup` to verify the pinned commit)")
+    if a.contexts:
+        res = _context_equivalence(run_dir, root)
+        if res is None:
+            print("context equivalence: skipped (needs data/documents.sqlite or a checkout, and contexts.jsonl.gz)")
+        else:
+            print(f"context equivalence: {res['reproduced']}/{res['checked']} published context hashes reproduced "
+                  f"from the retrieval order and the corpus ({res['backend']})")
+            ok = ok and res["reproduced"] == res["checked"]
+            if a.log:
+                with open(a.log, "w", encoding="utf-8") as f:
+                    json.dump(res, f, indent=1)
+                print(f"wrote {a.log}")
     print("VERIFIED" if ok else "PROBLEMS FOUND")
     return 0 if ok else 1
+
+
+def _context_equivalence(run_dir: Path, root: Path | None) -> dict | None:
+    """Rebuild every published context from the saved retrieval order and the
+    corpus, and compare sha256 with the checkpoint. Offline; no LLM, no HydraDB."""
+    from . import hydrate
+    ck_path, ctx_path = run_dir / "gen_checkpoint.json", run_dir / "contexts.jsonl.gz"
+    if not ck_path.exists() or not ctx_path.exists():
+        return None
+    db = paths.documents_db_path()
+    if not db.exists() and not (root and (root / "generated_data" / "uuid_index.json").exists()):
+        return None
+    try:
+        store = hydrate.DocumentStore(db if db.exists() else None, root)
+    except FileNotFoundError:
+        return None
+    cfg = RunConfig.load(run_dir / "config.yaml") if (run_dir / "config.yaml").exists() else RunConfig()
+    with open(ck_path, "r", encoding="utf-8") as f:
+        rows = [r for r in json.load(f) if "question_id" in r]
+    published: dict[str, str] = {}
+    with gzip.open(ctx_path, "rt", encoding="utf-8") as f:
+        for line in f:
+            c = json.loads(line)
+            published[c["question_id"]] = c["context_sha256"]
+    checked = reproduced = 0
+    mismatched: list[str] = []
+    for r in rows:
+        if r["question_id"] not in published:
+            continue
+        ctx = hydrate.build_context(r["retrieved_doc_ids"], [], store, cfg.generation.docs_in_context,
+                                    cfg.generation.max_context_chars)
+        checked += 1
+        if ctx["context_sha256"] == published[r["question_id"]] == r.get("context_sha256"):
+            reproduced += 1
+        else:
+            mismatched.append(r["question_id"])
+    return {"checked": checked, "reproduced": reproduced, "mismatched": mismatched, "backend": store.backend,
+            "docs_in_context": cfg.generation.docs_in_context, "max_context_chars": cfg.generation.max_context_chars,
+            "erb_commit": _checkout_commit(root) if root else None, "finished_at": manifest.now_iso()}
 
 
 def cmd_stats(a: argparse.Namespace) -> int:
@@ -276,12 +355,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("generate"); s.add_argument("--config", required=True); s.add_argument("--run-dir", required=True)
     s.add_argument("--questions"); s.add_argument("--targets"); s.add_argument("--n", type=int)
     s.add_argument("--retrieval-only", action="store_true"); s.add_argument("--from-contexts")
-    s.add_argument("--force-resume", action="store_true"); s.set_defaults(fn=cmd_generate)
+    s.add_argument("--force-resume", action="store_true"); s.add_argument("--allow-unpinned", action="store_true")
+    s.set_defaults(fn=cmd_generate)
 
     s = sub.add_parser("judge"); s.add_argument("--config", required=True); s.add_argument("--run-dir", required=True)
     s.add_argument("--protocol", choices=["strict", "official"], default="strict")
     s.add_argument("--answers"); s.add_argument("--results"); s.add_argument("--erb"); s.add_argument("--questions")
-    s.add_argument("--question-id"); s.add_argument("--expect-n", type=int, default=None); s.set_defaults(fn=cmd_judge)
+    s.add_argument("--question-id"); s.add_argument("--expect-n", type=int, default=None)
+    s.add_argument("--allow-unpinned", action="store_true"); s.set_defaults(fn=cmd_judge)
 
     s = sub.add_parser("report"); s.add_argument("--run-dir", required=True); s.add_argument("--title")
     s.add_argument("--questions"); s.add_argument("--leaderboard"); s.add_argument("--out"); s.set_defaults(fn=cmd_report)
@@ -295,7 +376,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--b", required=True); s.add_argument("--questions"); s.add_argument("--ctx", type=int, default=12)
     s.add_argument("--ids"); s.set_defaults(fn=cmd_recall)
 
-    s = sub.add_parser("verify"); s.add_argument("--run-dir", required=True); s.set_defaults(fn=cmd_verify)
+    s = sub.add_parser("verify"); s.add_argument("--run-dir", required=True)
+    s.add_argument("--contexts", action="store_true", help="also rebuild every context from the corpus and compare hashes")
+    s.add_argument("--log", help="write the context-equivalence result to this JSON file"); s.set_defaults(fn=cmd_verify)
     s = sub.add_parser("stats"); s.add_argument("--results", required=True); s.set_defaults(fn=cmd_stats)
     return p
 

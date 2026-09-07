@@ -64,16 +64,22 @@ def patches_applied(erb_root: Path) -> bool:
 def judge_env(cfg: RunConfig) -> dict:
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
+    # CHEAP_LLM_MODEL_NAME is used by the evaluator's JSON-recovery helper
+    # (src/utils/json_recovery.py -> get_cheap_llm). Left unset, it defaults to
+    # "gpt-5-mini", which OpenRouter does not resolve; the published run left it
+    # unset (see METHODOLOGY section 6).
     if cfg.judge.provider == "openrouter":
         key = os.environ.get("OPENROUTER_API_KEY")
         if not key:
             raise RuntimeError("OPENROUTER_API_KEY is not set")
-        env.update({"LLM_PROVIDER": "openrouter", "LLM_MODEL_NAME": cfg.judge.model, "OPENROUTER_API_KEY": key})
+        env.update({"LLM_PROVIDER": "openrouter", "LLM_MODEL_NAME": cfg.judge.model,
+                    "CHEAP_LLM_MODEL_NAME": cfg.judge.cheap_model, "OPENROUTER_API_KEY": key})
     elif cfg.judge.provider == "openai":
         key = os.environ.get("OPENAI_API_KEY")
         if not key:
             raise RuntimeError("OPENAI_API_KEY is not set")
-        env.update({"LLM_PROVIDER": "openai", "LLM_MODEL_NAME": cfg.judge.model, "LLM_API_KEY": key})
+        env.update({"LLM_PROVIDER": "openai", "LLM_MODEL_NAME": cfg.judge.model,
+                    "CHEAP_LLM_MODEL_NAME": cfg.judge.cheap_model, "LLM_API_KEY": key})
         env.pop("OPENROUTER_API_KEY", None)
     else:
         raise ValueError(f"unknown judge provider {cfg.judge.provider!r}")
@@ -107,7 +113,7 @@ def run_strict(cfg: RunConfig, run_dir: Path, erb_root: Path, questions: Path, a
     env = judge_env(cfg)
     env["PYTHONPATH"] = str(erb_root)
     cmd = _cmd(erb_root, answers.resolve(), questions.resolve(), results.resolve(),
-               run_dir / "questions_updated_strict.jsonl", cfg.judge.parallelism, True, question_id)
+               run_dir / "questions_updated_strict.jsonl", cfg.judge.strict_parallelism, True, question_id)
     print("  " + " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=erb_root, env=env, check=True, stdin=subprocess.DEVNULL)
     manifest.write_manifest(run_dir, "judge_strict", cfg.to_dict(), [results],
@@ -173,10 +179,10 @@ def run_official(cfg: RunConfig, run_dir: Path, erb_root: Path, questions: Path,
         upd = shard_dir / f"questions_updated_{sid}.jsonl"
         log = open(shard_dir / f"log_{sid}.txt", "w", encoding="utf-8")
         cmd = _cmd(erb_root, shard.resolve(), questions.resolve(), res.resolve(), upd.resolve(),
-                   cfg.judge.parallelism, False, None)
+                   cfg.judge.shard_parallelism, False, None)
         procs.append((sid, res, subprocess.Popen(cmd, cwd=erb_root, env=env, stdout=log, stderr=subprocess.STDOUT,
                                                   stdin=subprocess.DEVNULL), log))
-    print(f"  launched {len(procs)} shards x {cfg.judge.parallelism} workers", flush=True)
+    print(f"  launched {len(procs)} shards x {cfg.judge.shard_parallelism} workers", flush=True)
     failed = []
     for sid, res, p, log in procs:
         p.wait()

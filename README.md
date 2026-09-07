@@ -3,7 +3,7 @@
 Reproducible harness and published artifacts for HydraDB's result on
 [EnterpriseRAG-Bench](https://github.com/onyx-dot-app/EnterpriseRAG-Bench), Onyx's
 benchmark of retrieval-augmented generation over company-internal data
-(511,958 documents across nine enterprise systems, 500 questions).
+(511,958 exported documents across nine enterprise systems, 500 questions).
 
 | Run of 2026-09-04 (all 500 questions) | Combined score | Correctness | Completeness | Document recall @10 | Invalid extra docs @10 |
 |---|---|---|---|---|---|
@@ -19,12 +19,17 @@ Every number above is recomputed from the per-question rows in
 [`artifacts/run-2026-09-04/`](artifacts/run-2026-09-04/) by the test suite and by
 `erb-hydradb verify`. [`RESULTS.md`](RESULTS.md) is generated from those files.
 
+The artifacts were produced by the scripts this package was ported from; the
+port is checked against them (converter identical on all 511,962 source files;
+all 500 published contexts rebuilt hash-for-hash by `verify --contexts`).
+METHODOLOGY.md section 7 has the details and the full run history.
+
 ## What is in this repository
 
 | Path | What |
 |---|---|
 | `artifacts/run-2026-09-04/` | The published run: `answers.jsonl` (submission format), both evaluator results files, the exact context the answer model saw for every question (`contexts.jsonl.gz`, sha256-linked to the checkpoint), the top-50 retrieval order per question (`gen_checkpoint.json`), `manifest.json`, `SHA256SUMS`. |
-| `artifacts/baseline-2026-09-04/` | The earlier chunk-based pipeline (64.23) the run is compared against in `RESULTS.md`. |
+| `artifacts/baseline-2026-09-04/` | The earlier chunk-based pipeline (64.23) the run is compared against in `RESULTS.md`. Its generator is not part of this package, so it is a record, not a reproducible run. |
 | `config/run-2026-09-04.yaml` | Every parameter of the published run. |
 | `src/erb_hydradb/` | The harness: corpus build, typed app-source conversion and ingestion into HydraDB, retrieval + generation, evaluator wrapper, paired analysis. |
 | `METHODOLOGY.md` | Exactly what the pipeline does at each stage, and what it does not do. |

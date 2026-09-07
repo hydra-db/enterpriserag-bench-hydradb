@@ -19,7 +19,8 @@ Costs are for GPT-5.4 via OpenRouter at September 2026 prices and are approximat
 ```bash
 .venv/bin/python -m erb_hydradb verify --run-dir artifacts/run-2026-09-04
 .venv/bin/python -m erb_hydradb report --run-dir artifacts/run-2026-09-04 \
-    --questions tests/data/questions.jsonl --leaderboard scripts/leaderboard-2026-08-28.json --out RESULTS.md
+    --questions tests/data/questions.jsonl --leaderboard scripts/leaderboard-2026-08-28.json \
+    --title "HydraDB on EnterpriseRAG-Bench: published run 2026-09-04" --out /tmp/RESULTS.md   # identical to the committed RESULTS.md
 .venv/bin/python -m erb_hydradb compare \
     --a artifacts/baseline-2026-09-04/official_results_strict.json --answers-a artifacts/baseline-2026-09-04/answers.jsonl \
     --b artifacts/run-2026-09-04/official_results_strict.json --checkpoint-b artifacts/run-2026-09-04/gen_checkpoint.json \
@@ -29,6 +30,11 @@ Costs are for GPT-5.4 via OpenRouter at September 2026 prices and are approximat
 Expected: `VERIFIED`; combined 88.73 (official) / 88.30 (strict); paired delta vs
 the baseline +24.07 with 95 % CI [20.27, 28.01]; flips F→T 124, T→F 10.
 
+With the benchmark checkout present (after `setup`), `verify --contexts` also
+rebuilds all 500 contexts the answer model saw from the saved retrieval order
+and the corpus and checks their sha256 against the published ones. Expected:
+500 of 500.
+
 ## Setup for levels 1 to 4
 
 ```bash
@@ -36,9 +42,9 @@ the baseline +24.07 with 95 % CI [20.27, 28.01]; flips F→T 124, T→F 10.
 echo "ERB_REPO=$PWD/EnterpriseRAG-Bench" >> .env
 ```
 
-The clone uses `--filter=blob:none`; the first evaluator run with the official
-protocol will fetch document blobs on demand. If you prefer a full clone, drop
-the filter.
+The benchmark repository contains the corpus as 511,962 files: the clone is
+about 5 GB on disk and takes a few minutes. (`--filter=blob:none` keeps history
+small; the working tree is still fully materialised.)
 
 Judge provider: set `judge.provider` in the config (or copy the config and edit).
 

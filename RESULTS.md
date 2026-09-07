@@ -20,8 +20,8 @@ n = 500 questions; recomputation matches the file
 | completeness | 20 | 37.92 | 40.0 % | 71.25 % | 76.17 % |
 | conflicting_info | 20 | 91.61 | 100.0 % | 91.61 % | 100.0 % |
 | miscellaneous | 20 | 97.5 | 100.0 % | 97.5 % | 100.0 % |
-| info_not_found | 20 | 100.0 | 100.0 % | 100.0 % | 0.0 % |
-| high_level | 10 | 62.17 | 70.0 % | 68.83 % | 0.0 % |
+| info_not_found | 20 | 100.0 | 100.0 % | 100.0 % | n/a (no gold documents) |
+| high_level | 10 | 62.17 | 70.0 % | 68.83 % | n/a (no gold documents) |
 
 ## Strict (no correction, no citation stripping)
 
@@ -41,8 +41,8 @@ n = 500 questions; recomputation matches the file
 | conflicting_info | 20 | 93.65 | 100.0 % | 93.65 % | 100.0 % |
 | completeness | 20 | 37.5 | 40.0 % | 72.15 % | 76.16 % |
 | miscellaneous | 20 | 98.75 | 100.0 % | 98.75 % | 100.0 % |
-| info_not_found | 20 | 100.0 | 100.0 % | 100.0 % | 0.0 % |
-| high_level | 10 | 64.67 | 70.0 % | 71.33 % | 0.0 % |
+| info_not_found | 20 | 100.0 | 100.0 % | 100.0 % | n/a (no gold documents) |
+| high_level | 10 | 64.67 | 70.0 % | 71.33 % | n/a (no gold documents) |
 
 ## Document recall at depth (checkpoint retrieved_doc_ids)
 

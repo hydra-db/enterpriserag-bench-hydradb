@@ -40,8 +40,10 @@
         "judge": {
           "model": "openai/gpt-5.4",
           "provider": "openrouter",
-          "parallelism": 5,
-          "shards": 20
+          "cheap_model": "openai/gpt-5-mini",
+          "strict_parallelism": 6,
+          "shards": 20,
+          "shard_parallelism": 5
         }
       },
       "files": {
@@ -53,8 +55,61 @@
         "config.yaml": "a137e8b6ba7813ba8f0e9c1bf24241fb870ae99ac68767c70e577bf071828b8e"
       },
       "produced_on": "2026-09-04",
-      "notes": "Artifacts of the published run. generate: 500/500 questions, 0 errors, 0 dropped docs; judge strict: single process, parallelism 6; judge official: 20 shards x 5 workers, 14 corrected questions. Judge routed via OpenRouter (chat completions).",
+      "notes": "Artifacts of the published run, produced by the originating scripts this package was ported from (see METHODOLOGY 7). generate: 500/500 questions, 0 errors, 0 dropped docs. judge strict: one process, 6 threads. judge official: 20 shards x 5 threads, 14 corrected questions. Judge routed via OpenRouter chat completions; CHEAP_LLM_MODEL_NAME was not set.",
       "generation_fingerprint": "23ed626ddbc0f556a2057fc05b4bd80227488fdb3ac0f2f412dfdb42f683a0ee"
+    },
+    {
+      "stage": "context_equivalence",
+      "finished_at": "2026-09-07T14:46:52+00:00",
+      "erb_hydradb_version": "1.0.0",
+      "repo_commit": "7084eb1f77609be793dd8887b0b2d8fc8cb6dd13",
+      "python": "3.11.16",
+      "upstream": {
+        "erb_commit": "d36685e273713975ee20299bbf1ab64165575b3c",
+        "questions_sha256": "f9524b9157cd43aae36b99333a124738804306ea6d07f332d49faa6d3d147905"
+      },
+      "config": {
+        "name": "run-2026-09-04",
+        "hydradb": {
+          "base_url": "https://api.hydradb.com",
+          "database": "erb_appsources",
+          "collection": "entire"
+        },
+        "retrieval": {
+          "mode": "thinking",
+          "alpha": 0.5,
+          "max_results": 100,
+          "query_by": "hybrid",
+          "query_apps": false
+        },
+        "generation": {
+          "model": "openai/gpt-5.4",
+          "provider": "openrouter",
+          "max_tokens": 4000,
+          "temperature": 0.0,
+          "docs_in_context": 12,
+          "submit_docs": 10,
+          "max_context_chars": 240000,
+          "correction_loop": true,
+          "prompts_version": "two-pass-v1",
+          "hydration": "canonical-v2",
+          "workers": 6
+        },
+        "judge": {
+          "model": "openai/gpt-5.4",
+          "provider": "openrouter",
+          "cheap_model": "openai/gpt-5-mini",
+          "strict_parallelism": 6,
+          "shards": 20,
+          "shard_parallelism": 5
+        }
+      },
+      "files": {
+        "context_equivalence.json": "3919708e20fd8f468cbd3581a3c93b63ec8764cb898fbc1dd71aec193d20abd7"
+      },
+      "checked": 500,
+      "reproduced": 500,
+      "backend": "checkout"
     }
   ]
 }

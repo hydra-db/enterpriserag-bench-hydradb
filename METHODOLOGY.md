@@ -21,7 +21,7 @@ Pinned in this harness:
 
 ## 2. Corpus and ingestion (HydraDB)
 
-The 511,958 documents were loaded into **one** HydraDB database/collection
+The corpus (511,962 source files in the checkout; 511,958 documents in the benchmark's export, which skips files lacking the required fields) was loaded into **one** HydraDB database/collection
 (`erb_appsources` / `entire`) as **typed app sources** via `POST /context/ingest`
 (`type=knowledge`, `app_knowledge` array), not as generic documents. The
 conversion is deterministic (`src/erb_hydradb/convert.py`):
@@ -104,6 +104,13 @@ A total budget of 240,000 characters applies; whole documents are dropped from
 the tail of the ranking, never cut mid-document, and drops are recorded
 (none occurred in the published run; median context 84k characters, max 188k).
 
+The header of each block carries the document's benchmark id (`dsid_…`). The
+answer model therefore sees document ids, and 24 of the 500 published answers
+mention one. These are the ids HydraDB returned, never gold ids (the pipeline
+reads only the `question` field of each question until scoring), but note the
+interaction with the two judge settings: the official protocol strips citations
+before judging, the strict setting does not.
+
 ## 5. Answer generation (GPT-5.4)
 
 Three calls per question with `openai/gpt-5.4` via OpenRouter, temperature 0,
@@ -118,6 +125,12 @@ Three calls per question with `openai/gpt-5.4` via OpenRouter, temperature 0,
 
 If the critique or rewrite call fails, the draft is used. No per-question or
 per-category logic exists anywhere in the pipeline.
+
+The prompts are written for this evaluator: the draft prompt tells the model
+that the answer "will be graded fact-by-fact against a gold reference" and asks
+for every specific value, id and step. That is a legitimate but deliberate
+choice, and it is why completeness is high; the prompts are published verbatim
+so it can be judged.
 
 ## 6. Scoring (benchmark evaluator)
 
@@ -147,25 +160,79 @@ question's completeness is recorded as 0 with no marker. The published run has
 one such row (`qst_0242`, correct, 0 %); re-judging it gave 100 %. Published
 numbers are the unadjusted run.
 
+The evaluator's JSON-recovery helper calls a second, "cheap" model
+(`CHEAP_LLM_MODEL_NAME`, upstream default `gpt-5-mini`). The published run did
+not set it, so under the OpenRouter patch that fallback would not have resolved
+and a recovery call could fail; this harness sets it from `judge.cheap_model`
+(`openai/gpt-5-mini` under OpenRouter). A failed recovery is one way to reach
+the completeness-zero row above.
+
+Statistics outside the evaluator (`verify`, `stats`, `report`, `compare`) are
+computed by `analysis.py`, a reimplementation of the evaluator's
+`compute_stats_for_group` (same arithmetic and rounding; the test suite checks
+that it reproduces both published results files to the cent). Merging
+official-protocol shards uses the evaluator's own function.
+
 ## 7. Provenance
 
-Two equivalence checks were run when this package was assembled from the code
-that produced the published run:
+**The published artifacts were produced by the scripts this package was ported
+from, not by this package.** The originating scripts lived in an internal
+evaluation repository; this package is a self-contained port of them, made so
+that the run can be reproduced without that repository. Visible consequences in
+the artifacts: the checkpoint's `_config` header has no fingerprint (the
+originating script did not write one), the context rows carry no
+`retrieved_doc_ids` (they are in the checkpoint), the official-protocol results
+file's `merged_from` paths are relative to the originating layout, and the
+answers are in the originating script's question order (a difficulty ordering)
+rather than file order. Runs made with this package differ in exactly those
+respects and in nothing that affects scores.
 
-- the conversion in `convert.py` produces output identical to the original
-  converter for every one of the 511,962 documents in the pinned checkout
-  (6,038,192 typed items, compared as sorted JSON and on per-item key order);
-- `hydrate.build_context` applied to the saved retrieval order reproduces the
-  published context sha256 for every question checked (25 of 25), i.e. the
-  contexts in `contexts.jsonl.gz` are a pure function of the retrieval order and
-  the benchmark's canonical document text.
+Equivalence between the port and the originating code was checked and is
+checkable:
 
+- `convert.py` produces output identical to the original converter for every
+  one of the 511,962 source files in the pinned checkout (6,038,192 typed items,
+  compared as sorted JSON and on per-item key order).
+- `erb-hydradb verify --contexts` rebuilds every published context from the
+  saved retrieval order and the corpus and compares sha256 with both the
+  checkpoint and `contexts.jsonl.gz`. The result for the published run is in
+  `artifacts/run-2026-09-04/context_equivalence.json`: 500 of 500.
+- The prompts are the originating prompts verbatim; the retrieval request body
+  is the same field for field (`hydradb_client.py`).
 
-Every stage writes to `manifest.json` in the run directory: package version,
-repository commit, Python version, the full config, the pinned upstream
-identifiers, and sha256 of every file it produced; `SHA256SUMS` covers the whole
-directory. The generation checkpoint carries a configuration fingerprint and
-refuses to resume under a different configuration.
+For runs made with this package, every stage appends to `manifest.json` in the
+run directory (package version, repository commit, Python version, the full
+config, the pinned upstream identifiers, sha256 of every file it produced), and
+`SHA256SUMS` covers the directory. The generation checkpoint carries a
+configuration fingerprint and refuses to resume under a different one. The
+published run's manifest was written when the artifacts were assembled and says
+so in its `stage` field.
+
+### Run history
+
+Everything that was run against this collection before the published result,
+so that "88.73" can be read as what it is: one full run, not a best-of.
+
+| Date | Scope | Pipeline | Combined (strict) | Kept as |
+|---|---|---|---|---|
+| 2026-09-04 | 500 | top-12 chunks, fast retrieval, up to 50 ids | 64.23 | `artifacts/baseline-2026-09-04` |
+| 2026-09-04 | 76-question pilot | full documents (raw JSON, later found to render benchmark-internal fields), fast | 80.00 | not published |
+| 2026-09-04 | 76-question pilot | full documents (raw JSON), thinking | 88.49 | not published |
+| 2026-09-04 | 76-question pilot | full documents (canonical), thinking | 88.42 | not published |
+| 2026-09-04 | 500 (stopped at 22) | full documents (raw JSON), thinking | never judged | discarded |
+| 2026-09-04 | 500 | full documents (canonical), thinking | 88.30 strict / 88.73 official | **`artifacts/run-2026-09-04`** |
+
+The pilot subset (76 questions, stratified by category) was used only to choose
+the configuration; the 500-question run was then made once with it. The pilot
+questions are not held out from the 500.
+
+### What HydraDB received
+
+HydraDB's ingestion received only the converted items (`convert.py`): the
+benchmark's exported title and content of each document, split into typed
+items with the fields listed in section 2, and a flat metadata dictionary. It
+received no questions, no gold answers, no gold document ids, and none of the
+benchmark-internal annotation fields.
 
 ## 8. What this harness does not do
 

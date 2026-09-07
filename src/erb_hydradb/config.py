@@ -51,8 +51,12 @@ class GenerationConfig:
 class JudgeConfig:
     model: str = "openai/gpt-5.4"   # the evaluator's default judge
     provider: str = "openrouter"    # openrouter | openai
-    parallelism: int = 5
-    shards: int = 20                # official protocol only; strict runs in one process
+    # The evaluator's JSON-recovery path calls a second, "cheap" model
+    # (upstream default gpt-5-mini). It must be a valid id for the provider.
+    cheap_model: str = "openai/gpt-5-mini"
+    strict_parallelism: int = 6     # threads in the single strict process
+    shards: int = 20                # official protocol: concurrent processes
+    shard_parallelism: int = 5      # threads per shard
 
 
 @dataclass

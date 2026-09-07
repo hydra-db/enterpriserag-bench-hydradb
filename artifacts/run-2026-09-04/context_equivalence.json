@@ -1,0 +1,10 @@
+{
+ "checked": 500,
+ "reproduced": 500,
+ "mismatched": [],
+ "backend": "checkout",
+ "docs_in_context": 12,
+ "max_context_chars": 240000,
+ "erb_commit": "d36685e273713975ee20299bbf1ab64165575b3c",
+ "finished_at": "2026-09-07T14:45:47+00:00"
+}

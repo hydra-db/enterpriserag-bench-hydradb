@@ -50,20 +50,10 @@ def erb_doc_id(chunk_or_id: dict | str) -> str:
 
 
 def extract_document_content(doc: dict) -> tuple[str, str]:
-    """The benchmark's canonical (title, content) rule, mirrored exactly."""
-    title = str(doc[doc["title_field_name"]])
-    names = doc["content_field_names"]
-    if not isinstance(names, list) or not names:
-        raise KeyError("content_field_names")
-    if len(names) == 1:
-        return title, str(doc[names[0]])
-    parts = []
-    for name in names:
-        value = doc[name]
-        if isinstance(value, list):
-            value = "\n".join(str(v) for v in value)
-        parts.append(f"{name}:\n{value}")
-    return title, "\n\n".join(parts)
+    """The benchmark's canonical (title, content) rule. One implementation,
+    in ``corpus.py`` (mirrors the ERB repository's document_content.py)."""
+    from .corpus import extract_document_content as _extract
+    return _extract(doc)
 
 
 @dataclass
@@ -99,6 +89,8 @@ class DocumentStore:
 
     @property
     def backend(self) -> str:
+        if self._conn is not None and self._index is not None:
+            return "sqlite+checkout"
         return "sqlite" if self._conn is not None else "checkout"
 
     def get(self, doc_id: str) -> Document | None:
@@ -120,7 +112,7 @@ class DocumentStore:
             raw = json.load(f)
         try:
             title, content = extract_document_content(raw)
-        except (KeyError, TypeError):
+        except (KeyError, TypeError, ValueError):
             return None
         return Document(doc_id, rel.split("/")[0], title, content)
 
