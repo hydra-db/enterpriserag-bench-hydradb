@@ -51,6 +51,7 @@ import time
 from pathlib import Path
 
 from . import hydrate, manifest, validate
+from . import identity as ident_mod
 from .config import RunConfig
 from .llm import complete
 from .prompts import CRITIQUE_PROMPT, PASS1_PROMPT, PASS2_PROMPT, PROMPTS_VERSION
@@ -154,6 +155,29 @@ def load_checkpoint(path: Path, identity: dict, force: bool) -> tuple[list[dict]
     return keep, notes
 
 
+def check_selection(run_dir: Path, rows: list[dict], requested_ids: list[str], *,
+                    retrieval_only: bool, force: bool) -> list[str]:
+    """A checkpoint may only be continued or EXTENDED. Returns the ids the
+    checkpoint has beyond the selection (empty normally). Without ``force`` a
+    narrower selection is refused; with it, the extra rows must already be
+    complete and the caller exports them as well, so answers, contexts and
+    checkpoint keep agreeing with each other."""
+    have = {x["question_id"]: x for x in rows}
+    extra = sorted(set(have) - set(requested_ids))
+    if not extra:
+        return []
+    if not force:
+        raise SystemExit(f"Refusing to resume {run_dir} with a narrower selection: the checkpoint has {len(extra)} "
+                         f"questions not in this selection {extra[:5]}. Select a superset, use a new run "
+                         f"directory, or --force-resume (the extra rows are then exported too).")
+    unfinished = [q for q in extra if not (have[q]["stage"] == "answered"
+                                           or (retrieval_only and have[q]["stage"] == "retrieved"))]
+    if unfinished:
+        raise SystemExit(f"Refusing to resume {run_dir}: {len(unfinished)} checkpoint questions outside this "
+                         f"selection are not complete {unfinished[:5]}; select a superset that includes them.")
+    return extra
+
+
 def write_answers(rows: list[dict], out: Path) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".jsonl.tmp")
@@ -185,19 +209,12 @@ def load_published_contexts(path: Path, requested: list[dict]) -> dict[str, dict
 def saved_context(run_dir: Path, qid: str, sha256: str | None) -> dict | None:
     """The attempt-history row for ``qid`` whose actual text hashes to ``sha256``
     (or the latest row when no hash is given)."""
-    path = run_dir / ATTEMPTS
-    if not path.exists():
-        return None
     found = None
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            r = json.loads(line)
-            if r.get("question_id") != qid:
-                continue
-            if sha256 is None or validate.sha256_text(r.get("context", "")) == sha256:
-                found = r
+    for r in ident_mod.read_journal(run_dir / ATTEMPTS):
+        if r.get("question_id") != qid:
+            continue
+        if sha256 is None or validate.sha256_text(r.get("context", "")) == sha256:
+            found = r
     return found
 
 
@@ -207,16 +224,10 @@ def materialise_contexts(run_dir: Path, rows: list[dict]) -> Path:
     wanted = {r["question_id"]: r["context_sha256"] for r in rows
               if r.get("stage") in ("retrieved", "answered") and r.get("context_sha256")}
     chosen: dict[str, dict] = {}
-    path = run_dir / ATTEMPTS
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                r = json.loads(line)
-                qid = r.get("question_id")
-                if qid in wanted and validate.sha256_text(r.get("context", "")) == wanted[qid]:
-                    chosen[qid] = {k: r[k] for k in validate.CONTEXT_ROW_KEYS} | {"retrieved_doc_ids": r.get("retrieved_doc_ids", [])}
+    for r in ident_mod.read_journal(run_dir / ATTEMPTS):
+        qid = r.get("question_id")
+        if qid in wanted and validate.sha256_text(r.get("context", "")) == wanted[qid]:
+            chosen[qid] = {k: r[k] for k in validate.CONTEXT_ROW_KEYS} | {"retrieved_doc_ids": r.get("retrieved_doc_ids", [])}
     out = run_dir / CONTEXTS
     tmp = run_dir / (CONTEXTS + ".tmp")
     with gzip.open(tmp, "wt", encoding="utf-8") as f:
@@ -252,16 +263,23 @@ async def run_generate(cfg: RunConfig, run_dir: Path, questions: list[dict], *, 
     by_id = {x["question_id"]: x for x in rows}
     requested_ids = [q["question_id"] for q in questions]
     done = {qid for qid, x in by_id.items() if x["stage"] == "answered" or (retrieval_only and x["stage"] == "retrieved")}
+    # a checkpoint may only be continued or EXTENDED. A narrower selection would leave rows in
+    # the checkpoint that answers.jsonl / contexts.jsonl.gz no longer export, so the artifacts
+    # would disagree with each other. Refused before anything is written; --force-resume keeps
+    # and exports the extra rows as well, provided they are already complete.
+    extra = check_selection(run_dir, rows, requested_ids, retrieval_only=retrieval_only, force=force_resume)
+    if extra:
+        notes.append(f"forced resume with {len(extra)} completed checkpoint rows outside the selection; exported as well")
+        print(f"  resume: {notes[-1]}", flush=True)
+        requested_ids = requested_ids + extra
     to_finish = [q for q in questions if q["question_id"] in by_id and q["question_id"] not in done]
     to_query = [q for q in questions if q["question_id"] not in by_id]
     total = len(requested_ids)
     lock = asyncio.Lock()
     sem = asyncio.Semaphore(g.workers)
-    counter = {"n": sum(1 for q in questions if q["question_id"] in done)}
-    attempt_no = {"n": 0}
-    if attempts_path.exists():
-        with open(attempts_path, "r", encoding="utf-8") as f:
-            attempt_no["n"] = sum(1 for line in f if line.strip())
+    counter = {"n": sum(1 for q in requested_ids if q in done)}
+    # a torn trailing attempt record (interrupted append) is quarantined here, before any new append
+    attempt_no = {"n": len(ident_mod.read_journal(attempts_path))}
 
     published: dict[str, dict] = {}
     if from_contexts:
@@ -279,12 +297,10 @@ async def run_generate(cfg: RunConfig, run_dir: Path, questions: list[dict], *, 
         """Durable evidence first: the context is on disk before the checkpoint
         row that depends on it is written."""
         attempt_no["n"] += 1
-        with open(attempts_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"question_id": qid, "attempt": attempt_no["n"], "recorded_at": manifest.now_iso(),
-                                **{k: ctx[k] for k in validate.CONTEXT_ROW_KEYS if k != "question_id"},
-                                "retrieved_doc_ids": retrieved}, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        ident_mod.append_journal(attempts_path, {"question_id": qid, "attempt": attempt_no["n"],
+                                                "recorded_at": manifest.now_iso(),
+                                                **{k: ctx[k] for k in validate.CONTEXT_ROW_KEYS if k != "question_id"},
+                                                "retrieved_doc_ids": retrieved})
 
     async def query(client: HydraDBQueryClient, question: str) -> list[dict]:
         import httpx

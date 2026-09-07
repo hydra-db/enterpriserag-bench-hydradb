@@ -8,7 +8,9 @@ of an uninterrupted run (reviewer finding P1-2).
 
 from __future__ import annotations
 
+import copy
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -788,3 +790,261 @@ def test_crash_after_status_append_with_a_failed_id_keeps_it_failed_on_resume(tm
     assert exc_info.value.readiness == _readiness(2, 1, 1, 0, 0)
     assert exc_info.value.failed_ids == {"d2": {"batch": 1, "status": "errored", "attempts": 1}}
     assert len(ingest.read_status_log(run_dir / "ingest_status.jsonl")) == 2 == len(_status_log(run_dir))
+
+
+# ---------------------------------------------------------------------------
+# release re-review: corpus content identity (P1-1), endpoint identity (P2-6), torn status log (P2-3)
+# ---------------------------------------------------------------------------
+def _two_doc_corpus(path: Path, body: str = "ORIGINAL BODY", revision: str = "revision-A") -> Path:
+    """The reviewer probe's corpus: ``d1`` carries ``body``, ``d2`` a stable one; identity ``repo@revision``."""
+    return _small_corpus(path, [("d1", body), ("d2", "STABLE BODY")], revision=revision)
+
+
+def _tear_status_log_append(monkeypatch, on_call: int) -> None:
+    """Make the ``on_call``-th append to the status log write half of its first line, fsync it, then raise.
+
+    Models a process dying in the middle of ``f.write``: the bytes that reached
+    the disk are a torn JSON fragment, and the checkpoint after the append never
+    happens. Every other ``open`` in the ingest module passes through.
+    """
+    original_open = open
+    seen = {"appends": 0}
+
+    class Torn:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def write(self, data):
+            self.handle.write(data[: len(data) // 2])
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+            raise OSError("simulated crash during status-log write")
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+    def torn_open(file, mode="r", *args, **kwargs):
+        handle = original_open(file, mode, *args, **kwargs)
+        if Path(file).name == ingest.STATUS_LOG_NAME and mode == "a":
+            seen["appends"] += 1
+            if seen["appends"] == on_call:
+                return Torn(handle)
+        return handle
+
+    monkeypatch.setattr(ingest, "open", torn_open, raising=False)
+
+
+def test_reviewer_probe_same_revision_changed_content_is_refused_on_resume(tmp_path, cfg, fake_client):
+    """OPEN_SAME_REVISION_CONTENT: same ids, source and revision label, changed body.
+
+    Was: the identities compared equal, the resume was accepted and the
+    replacement body was sent under the original corpus's checkpoint.
+    """
+    original = _two_doc_corpus(tmp_path / "original.sqlite")
+    replaced = _two_doc_corpus(tmp_path / "same-revision.sqlite", body="REPLACEMENT CONTENT")
+    a, b = ingest.corpus_identity(original), ingest.corpus_identity(replaced)
+    assert list(a) == ["source", "revision", "documents", "doc_ids_sha256", "content_sha256"]
+    assert {k: v for k, v in a.items() if k != "content_sha256"} == {k: v for k, v in b.items() if k != "content_sha256"}
+    assert a["content_sha256"] != b["content_sha256"] and len(a["content_sha256"]) == 64
+    assert a != b
+
+    run_dir = tmp_path / "same-revision-content-change"
+    state_path = run_dir / "ingest_state.json"
+    fake_client.fail_send_on_call = 1
+    with pytest.raises(ConnectionError):
+        _run(cfg, original, state_path)
+    assert json.loads(state_path.read_text())["corpus"]["content_sha256"] == a["content_sha256"]
+    assert json.loads(state_path.read_text())["journal"][0]["state"] == "sending"
+
+    clients_before = len(fake_client.instances)
+    with pytest.raises(RuntimeError, match=r"refusing to resume.*corpus\.content_sha256="
+                                            rf"'{a['content_sha256']}'.*corpus\.content_sha256='{b['content_sha256']}'"):
+        _run(cfg, replaced, state_path, resume=True)
+    assert len(fake_client.instances) == clients_before  # refused before a client existed: nothing was sent
+    assert not (run_dir / "ingest_manifest.json").exists()
+    assert json.loads(state_path.read_text())["journal"][0]["state"] == "sending"  # checkpoint untouched
+
+    # the original corpus resumes: the stuck batch is re-sent with the ORIGINAL body
+    fake_client.fail_send_on_call = None
+    rec = _run(cfg, original, state_path, resume=True)
+    sent = [it for batch in fake_client.instances[-1].ingested for it in batch]
+    assert [it["id"] for it in sent] == ["d1", "d2"]
+    assert "ORIGINAL BODY" in json.dumps(sent) and "REPLACEMENT" not in json.dumps(sent)
+    assert rec["ready"] is True and rec["readiness"] == _readiness(2, 2, 0, 0, 0)
+    assert rec["corpus"]["content_sha256"] == a["content_sha256"] and rec["corpus"]["revision"] == "revision-A"
+
+
+def test_normalize_endpoint_rule():
+    same = "https://api.hydradb.com"
+    assert ingest.normalize_endpoint("https://api.hydradb.com") == same
+    assert ingest.normalize_endpoint("https://API.hydradb.com/") == same
+    assert ingest.normalize_endpoint("HTTPS://Api.HydraDB.com///") == same
+    assert ingest.normalize_endpoint("  https://api.hydradb.com/?trace=1#x ") == same  # query / fragment are not the endpoint
+    assert ingest.normalize_endpoint("https://api.hydradb.com/v1/") == "https://api.hydradb.com/v1"
+    assert ingest.normalize_endpoint("api.hydradb.com") == same  # a bare host means https
+    # a different scheme, host, port or path IS a different endpoint
+    assert len({ingest.normalize_endpoint(u) for u in (
+        same, "http://api.hydradb.com", "https://staging.hydradb.com", "https://api.hydradb.com:8443",
+        "https://api.hydradb.com/v1", "https://different-offline-test.invalid")}) == 6
+
+
+def test_reviewer_probe_changed_endpoint_is_refused_before_any_reuse(tmp_path, cfg, fake_client):
+    """OPEN_CHANGED_ENDPOINT: complete against endpoint A, resume with only ``base_url`` changed.
+
+    Was: zero sends, zero polls, ``ready=True`` and a manifest recording endpoint B.
+    """
+    db = _two_doc_corpus(tmp_path / "docs.sqlite")
+    run_dir = tmp_path / "changed-endpoint"
+    state_path = run_dir / "ingest_state.json"
+    cfg.hydradb.base_url = "https://API.hydradb.com/"
+    rec = _run(cfg, db, state_path)
+    assert rec["ready"] is True
+    assert json.loads(state_path.read_text())["endpoint"] == "https://api.hydradb.com"
+    assert rec["hydradb"] == {"base_url": "https://API.hydradb.com/", "endpoint": "https://api.hydradb.com",
+                              "database": cfg.hydradb.database, "collection": cfg.hydradb.collection}
+    manifest_a = (run_dir / "ingest_manifest.json").read_text()
+
+    other = copy.deepcopy(cfg)
+    other.hydradb.base_url = "https://different-offline-test.invalid"
+    with pytest.raises(RuntimeError, match=r"refusing to resume.*endpoint='https://api\.hydradb\.com'.*"
+                                            r"endpoint='https://different-offline-test\.invalid'"):
+        _run(other, db, state_path, resume=True)
+    assert len(fake_client.instances) == 1  # no client for endpoint B: zero sends, zero polls
+    assert (run_dir / "ingest_manifest.json").read_text() == manifest_a  # the manifest still records endpoint A
+
+    # the same endpoint spelled differently is the same endpoint: the resume is accepted and has nothing to do
+    same = copy.deepcopy(cfg)
+    same.hydradb.base_url = "https://api.hydradb.com"
+    rec = _run(same, db, state_path, resume=True)
+    resumed = fake_client.instances[-1]
+    assert resumed.ingested == [] and resumed.waited == []
+    assert rec["ready"] is True and rec["hydradb"]["base_url"] == "https://api.hydradb.com"
+    assert rec["hydradb"]["endpoint"] == "https://api.hydradb.com"
+
+    # a checkpoint that predates the endpoint / content identity is refused outright
+    state = json.loads(state_path.read_text())
+    del state["endpoint"]
+    state_path.write_text(json.dumps(state))
+    with pytest.raises(RuntimeError, match="predates the endpoint / corpus-content identity"):
+        _run(same, db, state_path, resume=True)
+    state["endpoint"] = "https://api.hydradb.com"
+    del state["corpus"]["content_sha256"]
+    state_path.write_text(json.dumps(state))
+    with pytest.raises(RuntimeError, match="predates the endpoint / corpus-content identity"):
+        _run(same, db, state_path, resume=True)
+
+
+def test_reviewer_probe_torn_status_log_is_quarantined_and_resume_converges(tmp_path, cfg, fake_client, monkeypatch):
+    """OPEN_TORN_LOG_RESUME: the process dies mid-line while appending the first status record.
+
+    Was: every resume raised ``JSONDecodeError`` reading the log, before re-polling anything.
+    """
+    db = _two_doc_corpus(tmp_path / "docs.sqlite")
+    run_dir = tmp_path / "torn-status-log"
+    state_path = run_dir / "ingest_state.json"
+    log_path = run_dir / "ingest_status.jsonl"
+    _tear_status_log_append(monkeypatch, on_call=1)
+    with pytest.raises(OSError, match="simulated crash during status-log write"):
+        _run(cfg, db, state_path)
+    torn = log_path.read_bytes()
+    assert torn and not torn.endswith(b"\n")
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(torn)
+    state = json.loads(state_path.read_text())
+    assert [e["state"] for e in state["journal"]] == ["sent"] and state["journal"][0]["statuses"] == {}
+
+    rec = _run(cfg, db, state_path, resume=True)
+    resumed = fake_client.instances[-1]
+    [quarantine] = run_dir.glob("ingest_status.jsonl.torn-*")
+    assert quarantine.read_bytes() == torn + b"\n"
+    assert resumed.ingested == []  # the batch had been accepted: nothing re-sent ...
+    assert resumed.waited == [["d1", "d2"]]  # ... every id of the torn record's batch re-polled
+    assert rec["ready"] is True and rec["resolved"] is True and rec["readiness"] == _readiness(2, 2, 0, 0, 0)
+    assert _status_log(run_dir) == [{"batch": 1, "id": "d1", "status": "completed", "attempt": 1},
+                                    {"batch": 1, "id": "d2", "status": "completed", "attempt": 1}]
+    assert ingest.read_status_log(log_path) == _status_log(run_dir)
+    assert [e["state"] for e in json.loads(state_path.read_text())["journal"]] == ["settled"]
+
+    # a further resume finds a clean log: nothing quarantined, nothing polled, still ready
+    rec = _run(cfg, db, state_path, resume=True)
+    assert fake_client.instances[-1].waited == [] and rec["ready"] is True
+    assert len(list(run_dir.glob("ingest_status.jsonl.torn-*"))) == 1
+
+
+def test_torn_append_keeps_committed_rows_repolls_only_the_unresolved_and_matches_the_reference(
+        tmp_path, cfg, fake_client, monkeypatch):
+    db = _small_corpus(tmp_path / "docs.sqlite", [("d1", "one"), ("d2", "two"), ("d3", "three")])
+    ref_dir = tmp_path / "ref"
+    ref = _run(cfg, db, ref_dir / "s.json", batch_size=1, wait_window=1)
+    assert ref["ready"] is True and ref["batches"]["sent"] == 3
+    fake_client.instances.clear()
+
+    # one item per batch, one batch in flight: batch 1's row is committed, the append for batch 2 tears
+    run_dir = tmp_path / "run"
+    state_path = run_dir / "s.json"
+    log_path = run_dir / "ingest_status.jsonl"
+    _tear_status_log_append(monkeypatch, on_call=2)
+    with pytest.raises(OSError, match="simulated crash"):
+        _run(cfg, db, state_path, batch_size=1, wait_window=1)
+    crashed = fake_client.instances[-1]
+    assert [[it["id"] for it in b] for b in crashed.ingested] == [["d1"], ["d2"], ["d3"]]
+    assert crashed.waited == [["d1"], ["d2"]]
+    raw = log_path.read_bytes()
+    committed = json.dumps({"batch": 1, "id": "d1", "status": "completed", "attempt": 1}).encode() + b"\n"
+    assert raw.startswith(committed) and len(raw) > len(committed) and not raw.endswith(b"\n")
+    fragment = raw[len(committed):]
+    assert [e["state"] for e in json.loads(state_path.read_text())["journal"]] == ["settled", "sent", "sent"]
+
+    rec = _run(cfg, db, state_path, resume=True, batch_size=1, wait_window=1)
+    resumed = fake_client.instances[-1]
+    [quarantine] = run_dir.glob("ingest_status.jsonl.torn-*")
+    assert quarantine.read_bytes() == fragment + b"\n"
+    assert resumed.ingested == []
+    assert resumed.waited == [["d2"], ["d3"]]  # d1's committed row was kept; only the unresolved ids re-polled
+    assert rec["ready"] is True
+    assert rec["readiness"] == ref["readiness"] == _readiness(3, 3, 0, 0, 0)
+    assert rec["statuses"] == ref["statuses"] and rec["batches"] == ref["batches"] and rec["failed_ids"] == {}
+    assert rec["items"]["sent"] == ref["items"]["sent"] == 3
+    assert _status_log(run_dir) == _status_log(ref_dir) == [
+        {"batch": 1, "id": "d1", "status": "completed", "attempt": 1},
+        {"batch": 2, "id": "d2", "status": "completed", "attempt": 1},
+        {"batch": 3, "id": "d3", "status": "completed", "attempt": 1}]
+    assert ingest.read_status_log(log_path) == _status_log(run_dir)
+    state = json.loads(state_path.read_text())
+    assert [e["state"] for e in state["journal"]] == ["settled"] * 3 and state["failed_ids"] == {}
+    assert state["last_doc_id"] == "d3"
+
+
+def test_mid_journal_corruption_is_an_error_never_skipped(tmp_path, cfg, fake_client):
+    db = _two_doc_corpus(tmp_path / "docs.sqlite")
+    run_dir = tmp_path / "run"
+    state_path = run_dir / "ingest_state.json"
+    log_path = run_dir / "ingest_status.jsonl"
+    fake_client.pending_ids = {"d2"}
+    with pytest.raises(ingest.IngestIncomplete):
+        _run(cfg, db, state_path)
+    d1_row = json.dumps({"batch": 1, "id": "d1", "status": "completed", "attempt": 1})
+    assert log_path.read_text().splitlines() == [d1_row]
+
+    # a torn record in the MIDDLE of the log (a later append completed after it) is corruption, not a torn tail
+    corrupted = d1_row + "\n" + '{"batch": 1, "id": "d1", "st' + "\n" + json.dumps(
+        {"batch": 1, "id": "d2", "status": "completed", "attempt": 1}) + "\n"
+    log_path.write_text(corrupted)
+    with pytest.raises(ValueError, match=r"ingest_status\.jsonl: malformed record at line 2 .*not repairing mid-journal corruption"):
+        ingest.read_status_log(log_path)
+
+    fake_client.pending_ids = set()
+    clients_before = len(fake_client.instances)
+    with pytest.raises(ValueError, match="malformed record at line 2"):
+        _run(cfg, db, state_path, resume=True)
+    assert len(fake_client.instances) == clients_before  # stopped before a client existed: nothing polled, nothing sent
+    assert log_path.read_text() == corrupted  # the log is left exactly as found ...
+    assert list(run_dir.glob("ingest_status.jsonl.torn-*")) == []  # ... and nothing was quarantined
+    assert [e["state"] for e in json.loads(state_path.read_text())["journal"]] == ["sent"]

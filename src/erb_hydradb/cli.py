@@ -246,7 +246,9 @@ def cmd_generate(a: argparse.Namespace) -> int:
             store_identity["checkout_commit"] = _checkout_commit(erb)
     identity = generate.run_identity(cfg, questions_path=qpath, from_contexts=from_contexts,
                                      store_identity=store_identity)
-    generate.load_checkpoint(run_dir / "gen_checkpoint.json", identity, a.force_resume)
+    rows, _ = generate.load_checkpoint(run_dir / "gen_checkpoint.json", identity, a.force_resume)
+    generate.check_selection(run_dir, rows, [q["question_id"] for q in questions],
+                             retrieval_only=a.retrieval_only, force=a.force_resume)
     cfg.save(run_dir / "config.yaml")
     _, incomplete = asyncio.run(generate.run_generate(
         cfg, run_dir, questions, api_key=os.environ.get("HYDRADB_API_KEY"), store=store, questions_path=qpath,
@@ -410,10 +412,16 @@ def cmd_audit_corrections(a: argparse.Namespace) -> int:
     problems = validate.check_ids(records, None, "corrections")
     by_id = {r["question_id"]: r for r in records}
     flagged = {q for q, r in results.items() if r.get("corrected")}
+    # the evaluator flags a row `corrected` only when the gold set or gold answer changed;
+    # an update that only added valid_doc_ids is still a record (it changes invalid_extra_docs)
+    changed = {q for q, r in by_id.items() if r.get("doc_set_changed") or r.get("gold_answer_changed")}
     for q in sorted(flagged - set(by_id)):
         problems.append(f"{q} is flagged corrected but has no correction record")
-    for q in sorted(set(by_id) - flagged):
-        problems.append(f"{q} has a correction record but is not flagged corrected")
+    for q in sorted(changed - flagged):
+        problems.append(f"{q} has a gold-changing correction record but is not flagged corrected")
+    for q in sorted(set(by_id) - changed):
+        if not by_id[q].get("after", {}).get("valid_doc_ids"):
+            problems.append(f"{q} has a correction record that changes nothing")
     answers = {r["question_id"]: r for r in validate.read_jsonl_rows(run_dir / "answers.jsonl")} \
         if (run_dir / "answers.jsonl").exists() else {}
     for q, rec in by_id.items():

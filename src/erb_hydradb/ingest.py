@@ -86,14 +86,22 @@ move out of ``failed_ids``, ids that fail again stay with ``attempts`` bumped.
 
 Resume identity
 ---------------
-A checkpoint is only resumed for the same target (``database``,
+A checkpoint is only resumed for the same target (``endpoint`` — the
+normalised ``hydradb.base_url``, see ``normalize_endpoint`` — ``database``,
 ``collection``, ``infer``), the same source scope (``source_types``,
 ``limit``), the same corpus — ``source`` and ``revision`` from the corpus
-``meta`` table (``corpus.corpus_identity``), row count and a sha256 over every
-``doc_id`` in order — and the same converter (sha256 of ``convert.py``'s
-source, ``converter_sha256()``). A mismatch is refused with a message naming the
-field. The doc-id hash alone would accept a corpus rebuilt with different
-content under the same ids; the meta and converter fields close that gap.
+``meta`` table (``corpus.corpus_identity``), row count, a sha256 over every
+``doc_id`` in order and ``content_sha256``, a streaming sha256 over every
+row's (doc_id, title, content) (``identity.content_sha256_sqlite``; about a
+minute on the full corpus, computed at every run start and never read back
+from metadata) — and the same converter (sha256 of ``convert.py``'s source,
+``converter_sha256()``). A mismatch is refused with a message naming the
+field, before the HTTP client is constructed. The doc-id hash guarantees the
+journal's item ids are the ids this corpus produces; the content hash
+guarantees the content behind those ids is the content that was sent (a label
+such as ``revision`` cannot: a corpus rebuilt with the same ids and revision
+but a changed body is a different corpus). Checkpoints written before the
+endpoint / content identity existed are refused outright.
 
 Status log
 ----------
@@ -108,6 +116,15 @@ them, so that window normally leaves no duplicate at all. An id appears once
 per attempt (its original batch, then one row per retry batch). A fresh
 (non-resume) run starts a new log.
 
+The log is read through ``identity.read_journal``: an incomplete trailing
+record (the append itself was interrupted, before its checkpoint) is
+quarantined to ``ingest_status.jsonl.torn-<timestamp>`` and the log is
+truncated to its last complete record; the ids of that record are still
+unresolved in the journal and are simply re-polled. A resume repairs the log
+once, right after the identity check and before anything is appended to it.
+Corruption anywhere else in the log raises ``ValueError`` and is never
+skipped.
+
 Memory stays bounded regardless of corpus size: one document is converted at a
 time and at most ``batch_size`` items (plus the id lists of unresolved
 batches and the failed-id record) are resident.
@@ -116,6 +133,7 @@ Files written next to ``state_path``:
 
 * ``<state_path>``          checkpoint (cursor, counters, identity guard, journal, failed ids);
 * ``ingest_status.jsonl``   one ``{"batch", "id", "status", "attempt"}`` line per resolved attempt;
+* ``ingest_status.jsonl.torn-<ts>``  a torn trailing record quarantined by a resume (only if one was found);
 * ``ingest_manifest.json``  the run summary (counts, readiness, failed ids, wall time, config);
 * ``manifest.json`` / ``SHA256SUMS`` via ``manifest.write_manifest``.
 """
@@ -132,11 +150,13 @@ from collections import Counter, deque
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
 from . import convert as _convert_module
 from . import corpus, manifest
+from . import identity as _identity
 from .config import RunConfig
 from .convert import convert
 from .hydradb_client import HydraDBAdminClient
@@ -207,15 +227,28 @@ def _scope(source_types: list[str] | None) -> list[str] | None:
     return sorted(set(source_types)) if source_types else None
 
 
+def normalize_endpoint(base_url: str) -> str:
+    """The endpoint a checkpoint is bound to: ``scheme://host[:port]/path`` of ``base_url``,
+    lowercased, without query, fragment or trailing slash. ``https://API.hydradb.com/``
+    and ``https://api.hydradb.com`` are the same endpoint; a different host or path is not."""
+    raw = base_url.strip()
+    parts = urlsplit(raw if "://" in raw else f"//{raw}")
+    scheme = parts.scheme or "https"
+    return f"{scheme.lower()}://{parts.netloc.lower()}{parts.path.lower().rstrip('/')}"
+
+
 def corpus_identity(db_path: str | Path) -> dict:
     """Identity of ``documents.sqlite`` for the resume guard.
 
     ``source`` / ``revision`` come from the builder's ``meta`` table
     (``corpus.corpus_identity``; ``"unknown"`` / ``None`` for a file built
-    without one), ``documents`` is the row count and ``doc_ids_sha256`` a
-    sha256 over every ``doc_id`` in order. The doc-id hash guarantees the
-    journal's item ids are the ids this corpus produces; the meta fields
-    guarantee the *content* behind those ids is the content that was sent.
+    without one), ``documents`` is the row count, ``doc_ids_sha256`` a sha256
+    over every ``doc_id`` in order and ``content_sha256`` a streaming sha256
+    over every row's (doc_id, title, content) in that order
+    (``identity.content_sha256_sqlite``). The doc-id hash guarantees the
+    journal's item ids are the ids this corpus produces; the content hash
+    guarantees the *content* behind those ids is the content that was sent.
+    Streams the whole table (about a minute on the full corpus).
     """
     meta = corpus.corpus_identity(db_path)
     conn = corpus.connect_readonly(db_path)
@@ -228,13 +261,18 @@ def corpus_identity(db_path: str | Path) -> dict:
             total += 1
     finally:
         conn.close()
+    content = _identity.content_sha256_sqlite(db_path)
+    if content["rows"] != total:
+        raise RuntimeError(f"corpus {db_path} changed while its identity was being computed "
+                           f"({total} vs {content['rows']} rows)")
     return {"source": meta.get("source", "unknown"), "revision": meta.get("revision"),
-            "documents": total, "doc_ids_sha256": h.hexdigest()}
+            "documents": total, "doc_ids_sha256": h.hexdigest(), "content_sha256": content["content_sha256"]}
 
 
 def _new_state(cfg: RunConfig, infer: bool, source_types: list[str] | None, limit: int | None,
                db_path: Path, identity: dict) -> dict:
     return {
+        "endpoint": normalize_endpoint(cfg.hydradb.base_url),
         "database": cfg.hydradb.database,
         "collection": cfg.hydradb.collection,
         "infer": infer,
@@ -272,7 +310,11 @@ def _check_state_matches(state: dict, cfg: RunConfig, infer: bool, source_types:
         raise RuntimeError("refusing to resume: checkpoint predates the failed-item record / converter identity; "
                            "start a new run directory")
     have_corpus = state.get("corpus") or {}
+    if "endpoint" not in state or "content_sha256" not in have_corpus:
+        raise RuntimeError("refusing to resume: checkpoint predates the endpoint / corpus-content identity; "
+                           "start a new run directory")
     checks = [
+        ("endpoint", normalize_endpoint(cfg.hydradb.base_url), state.get("endpoint")),
         ("database", cfg.hydradb.database, state.get("database")),
         ("collection", cfg.hydradb.collection, state.get("collection")),
         ("infer", infer, bool(state.get("infer"))),
@@ -282,6 +324,7 @@ def _check_state_matches(state: dict, cfg: RunConfig, infer: bool, source_types:
         ("corpus.revision", identity["revision"], have_corpus.get("revision")),
         ("corpus.documents", identity["documents"], have_corpus.get("documents")),
         ("corpus.doc_ids_sha256", identity["doc_ids_sha256"], have_corpus.get("doc_ids_sha256")),
+        ("corpus.content_sha256", identity["content_sha256"], have_corpus.get("content_sha256")),
         ("converter.sha256", converter_sha256(), (state.get("converter") or {}).get("sha256")),
     ]
     for field, want, have in checks:
@@ -300,20 +343,17 @@ def read_status_log(path: str | Path) -> list[dict]:
     observe (and may make it log) the same terminal status again; reading
     through this function makes that harmless. An id that was retried has one
     row per batch it was sent in.
+
+    Reads through ``identity.read_journal``: an incomplete trailing record
+    (an append interrupted mid-line) is quarantined to a ``.torn-<timestamp>``
+    file and truncated away; a malformed record anywhere else raises
+    ``ValueError`` (never skipped).
     """
-    path = Path(path)
-    if not path.exists():
-        return []
     rows: dict[tuple[int, str], dict] = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            key = (row["batch"], row["id"])
-            rows.pop(key, None)  # keep first-appearance order but the last content
-            rows[key] = row
+    for row in _identity.read_journal(path):
+        key = (row["batch"], row["id"])
+        rows.pop(key, None)  # keep first-appearance order but the last content
+        rows[key] = row
     return list(rows.values())
 
 
@@ -461,16 +501,23 @@ def run_ingest(cfg: RunConfig, db_path: str | Path, state_path: str | Path, *,
 
     # -- resume point ------------------------------------------------------
     state: dict | None = None
-    identity = corpus_identity(db_path) if not dry_run else {}
+    identity: dict = {}
+    if not dry_run:
+        print(f"corpus identity: hashing every row of {db_path} (content sha256; about a minute on the "
+              "full corpus) ...", flush=True)
+        identity = corpus_identity(db_path)
     if resume and not dry_run:
         state = load_state(state_path)
         if state:
             _check_state_matches(state, cfg, infer, source_types, limit, identity)
+            # repair a torn trailing record left by an interrupted append before anything is appended again
+            logged_rows = len(read_status_log(status_log))
             unresolved = [e for e in state["journal"] if e["state"] != "settled"]
             print(f"resuming after doc_id {state['last_doc_id']} "
                   f"({state['docs_processed']:,} docs / {state['items_sent']:,} items already sent, "
                   f"{len(unresolved)} unresolved batch(es) to reconcile, "
-                  f"{len(state['failed_ids']):,} failed item(s) on record)", flush=True)
+                  f"{len(state['failed_ids']):,} failed item(s) on record, "
+                  f"{logged_rows:,} status row(s) in the log)", flush=True)
         else:
             print("no checkpoint found; starting from the beginning", flush=True)
     elif not dry_run:
@@ -770,8 +817,8 @@ def _finish(run_dir: Path, cfg: RunConfig, state_path: Path, status_log: Path, s
     record = {
         "stage": "ingest",
         "finished_at": manifest.now_iso(),
-        "hydradb": {"base_url": cfg.hydradb.base_url, "database": cfg.hydradb.database,
-                    "collection": cfg.hydradb.collection},
+        "hydradb": {"base_url": cfg.hydradb.base_url, "endpoint": normalize_endpoint(cfg.hydradb.base_url),
+                    "database": cfg.hydradb.database, "collection": cfg.hydradb.collection},
         **summary,
         "config": cfg.to_dict(),
         "state_file": state_path.name,

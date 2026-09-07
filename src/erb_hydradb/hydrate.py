@@ -71,7 +71,10 @@ class DocumentStore:
         self._conn: sqlite3.Connection | None = None
         self._index: dict[str, str] | None = None
         self._sources: Path | None = None
+        self._db_path: Path | None = None
+        self._identity: dict | None = None
         if db_path and Path(db_path).exists():
+            self._db_path = Path(db_path)
             self._conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
         if erb_repo:
@@ -89,15 +92,24 @@ class DocumentStore:
 
     @property
     def identity(self) -> dict:
-        """Where the documents come from, for manifests."""
+        """What the documents ARE, for run identity: content hash of the sqlite
+        corpus (computed from the rows, never read from metadata) and/or the
+        checkout's git state. Computed once per store instance."""
+        if getattr(self, "_identity", None) is not None:
+            return self._identity
+        from . import identity as _ident
         out: dict = {"backend": self.backend}
-        if self._conn is not None:
+        if self._conn is not None and self._db_path is not None:
             try:
-                out["sqlite"] = {k: v for k, v in self._conn.execute("SELECT key, value FROM meta").fetchall()}
+                meta = {k: v for k, v in self._conn.execute("SELECT key, value FROM meta").fetchall()}
             except sqlite3.OperationalError:
-                out["sqlite"] = {"source": "unknown"}
+                meta = {"source": "unknown"}
+            out["sqlite"] = {**meta, **_ident.content_sha256_sqlite(self._db_path)}
         if self._sources is not None:
-            out["checkout"] = str(self._sources.parent.parent)
+            root = self._sources.parent.parent
+            # content state only: a local path is not part of what the documents are
+            out["checkout"] = _ident.checkout_state(root)
+        self._identity = out
         return out
 
     @property

@@ -24,8 +24,22 @@ overlay. An overlay holds:
   code from the overlay via ``PYTHONPATH``);
 * ``uuid_index.json`` -- a copy of the checkout's ``generated_data/uuid_index.json``.
   The evaluator's ``--uuid-index-cache-file`` points here (it may regenerate
-  and rewrite that cache), so the checkout is never written;
-* ``overlay.json`` -- the identity the overlay was built from.
+  and rewrite that cache), so the checkout is never written. It is a
+  harness-owned cache, not the corpus identity;
+* ``overlay.json`` -- the identity the overlay was built from, including the
+  full corpus state (below).
+
+The corpus identity is ``identity.checkout_state(checkout)["corpus_identity"]``:
+the checkout's HEAD plus a content hash of everything git reports as modified,
+added, deleted or untracked under ``generated_data/`` and ``questions.jsonl``.
+Git already tracks content, so a clean tree at a known HEAD is a known corpus
+and any local edit of a document body changes the identity (the index file
+alone would not notice a changed body). The full state is recorded in
+``overlay.json``, ``shards.json`` and the manifest. Because the overlay links
+to the mutable checkout, every judge run (strict and official) reads the state
+again after the evaluator has finished and fails with ``EvaluatorFailed`` when
+it differs, leaving the results in place and marking the manifest stage
+``corpus_changed_during_run: true``.
 
 An overlay is built in a staging directory and published with one atomic
 rename; an existing overlay is reused as-is and never modified. The checkout
@@ -45,16 +59,29 @@ Two protocols:
   concurrent shards. Shard state lives in ``<run_dir>/protocol_shards/`` with a
   ``shards.json`` plan whose ``fingerprint`` covers the answers, questions,
   provider, models, shard layout, the evaluator identity (source tree, patches,
-  checkout HEAD) and the corpus identity (``uuid_index.json``). Re-running the
+  checkout HEAD) and the corpus identity described above. Re-running the
   same fingerprint re-runs only the shards that are missing or incomplete,
   passing the evaluator's own ``--resume``; previous results and logs are never
   deleted. A different fingerprint is refused (``PlanMismatch``) unless
   ``fresh=True``. ``fresh`` always takes precedence: the previous directory is
   renamed to ``protocol_shards.<timestamp>/`` even when the plan is identical,
   and every shard is judged again. While an official run is active the run
-  directory holds ``protocol_shards.lock`` (pid + timestamp); a second judge on
-  the same run directory is refused, and a lock whose pid is no longer alive is
-  cleared with a note.
+  directory holds ``protocol_shards.lock`` (``identity.acquire_lock``: the
+  owner record is published atomically with the lock and release is
+  owner-checked); a second judge on the same run directory is refused, and a
+  lock whose pid is no longer alive is cleared with a note.
+
+  After a successful merge the run's gold corrections are materialised as
+  ``<run_dir>/corrections.jsonl`` (one record per corrected question, in the
+  published format: the pinned original as ``before``, the evaluator's updated
+  row as ``after``, the judges' ``update_reasons`` and the change flags) and
+  ``<run_dir>/questions_effective.jsonl`` (every question with its correction
+  applied). Records are taken by SHARD OWNERSHIP: each shard's
+  ``questions_updated_<sid>.jsonl`` holds every question, so only the rows whose
+  id belongs to that shard's expected ids and carry ``updated: true`` are read
+  from it. The files are rewritten on every successful run, including a no-op
+  retry, and are empty (zero lines) when nothing was corrected so ``verify``
+  knows corrections were considered.
 
 Both protocols verify coverage after the evaluator exits: the set of judged
 question ids must equal the set of ids in the answers file (and ``expect_n``
@@ -75,7 +102,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -84,7 +110,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import manifest, paths, validate
+from . import identity, manifest, paths, validate
 from .config import RunConfig
 
 EVAL_SCRIPT = Path("src") / "scripts" / "answer_evaluation" / "metrics_based_eval.py"
@@ -97,6 +123,10 @@ OVERLAY_STATE = "overlay.json"
 UUID_INDEX = Path("generated_data") / "uuid_index.json"
 UUID_INDEX_CACHE = "uuid_index.json"        # the overlay's harness-owned copy
 LOCK_FILE = "protocol_shards.lock"
+CORRECTIONS = "corrections.jsonl"
+QUESTIONS_EFFECTIVE = "questions_effective.jsonl"
+CORPUS_PATHS = ("generated_data", "questions.jsonl")
+CORPUS_STATE_KEYS = ("head", "dirty", "dirty_content_sha256", "corpus_identity")
 ANSWER_ROW_KEYS = {"question_id", "answer", "document_ids"}
 FINGERPRINT_KEYS = ("answers_sha256", "questions_sha256", "provider", "model", "cheap_model",
                     "shard_parallelism", "shard_count", "overlay_identity", "corpus_identity")
@@ -175,10 +205,21 @@ def patch_sha256s() -> dict[str, str]:
     return {rel: manifest.sha256_file(PATCH_DIR / fname) for rel, fname in PATCH_TARGETS.items()}
 
 
-def corpus_sha256(erb_root: Path) -> str | None:
-    """sha256 of the checkout's ``generated_data/uuid_index.json``; None when it does not exist yet."""
+def uuid_index_sha256(erb_root: Path) -> str | None:
+    """sha256 of the checkout's ``generated_data/uuid_index.json`` (provenance of the
+    overlay's cache copy; NOT the corpus identity); None when it does not exist yet."""
     p = Path(erb_root) / UUID_INDEX
     return manifest.sha256_file(p) if p.is_file() else None
+
+
+def corpus_state(erb_root: Path) -> dict:
+    """The checkout's corpus identity: HEAD plus a content hash of every file git
+    reports as changed or untracked under ``generated_data/`` and ``questions.jsonl``
+    (``identity.checkout_state``). Read-only; computed at use time."""
+    st = identity.checkout_state(Path(erb_root), CORPUS_PATHS)
+    if not st.get("head"):
+        raise CheckoutError(f"{erb_root}: git rev-parse HEAD failed; is it a git checkout?")
+    return {k: st[k] for k in CORPUS_STATE_KEYS}
 
 
 def answer_ids(answers: Path) -> list[str]:
@@ -272,8 +313,9 @@ def validate_answers(answers: Path, questions: Path, expect_n: int | None = None
 class CheckoutState:
     root: Path
     head: str
-    dirty_files: list[str]
+    dirty_files: list[str]          # under src/ (the evaluator's code)
     pinned: bool
+    corpus: dict = field(default_factory=dict)   # identity.checkout_state over the corpus paths
 
     @property
     def clean(self) -> bool:
@@ -281,11 +323,11 @@ class CheckoutState:
 
 
 def checkout_state(erb_root: Path) -> CheckoutState:
-    """HEAD and the ``git status --porcelain -- src`` list of the checkout. Read-only."""
+    """HEAD, the ``git status --porcelain -- src`` list and the corpus state of the checkout. Read-only."""
     head = _git(erb_root, "rev-parse", "HEAD").strip()
     porcelain = _git(erb_root, "status", "--porcelain", "--", "src")
     dirty = [line[3:].rstrip() for line in porcelain.splitlines() if line.strip()]
-    return CheckoutState(erb_root, head, dirty, head == paths.ERB_COMMIT)
+    return CheckoutState(erb_root, head, dirty, head == paths.ERB_COMMIT, corpus_state(erb_root))
 
 
 @dataclass
@@ -298,7 +340,9 @@ class Overlay:
     dirty_files: list[str]
     src_tree_sha256: str
     patch_sha256: dict[str, str]
-    corpus_sha256: str | None
+    corpus_identity: str
+    corpus_state: dict
+    uuid_index_sha256: str | None
     src_llm_sha256: dict[str, str]
     uuid_index_cache: str
     identity: dict = field(default_factory=dict)
@@ -320,10 +364,9 @@ def overlays_root() -> Path:
     return paths.data_dir() / "evaluator"
 
 
-def overlay_identity(provider: str, state: CheckoutState, tree: str, patches: dict[str, str],
-                     corpus: str | None) -> dict:
+def overlay_identity(provider: str, state: CheckoutState, tree: str, patches: dict[str, str]) -> dict:
     return {"provider": provider, "src_tree_sha256": tree, "patch_sha256": patches, "checkout": str(state.root),
-            "checkout_head": state.head, "corpus_sha256": corpus}
+            "checkout_head": state.head, "corpus_identity": state.corpus["corpus_identity"]}
 
 
 def overlay_name(identity: dict) -> str:
@@ -391,22 +434,22 @@ def evaluator_overlay(erb_root: Path, provider: str, *, allow_unpinned: bool = F
 
     patches = patch_sha256s() if provider == "openrouter" else {}
     tree = _src_tree_sha256(erb_src)
-    corpus = corpus_sha256(erb_root)
-    identity = overlay_identity(provider, state, tree, patches, corpus)
+    ident = overlay_identity(provider, state, tree, patches)
     root = overlays_root()
     root.mkdir(parents=True, exist_ok=True)
-    final = root / overlay_name(identity)
+    final = root / overlay_name(ident)
 
     def make(path: Path, links: dict, rebuilt: bool) -> Overlay:
         cwd = path if all(v["mode"] == "symlink" for v in links.values()) else erb_root
         src_llm = {p.relative_to(path).as_posix(): manifest.sha256_file(p) for p in _iter_src_files(path / "src" / "llm")}
         return Overlay(path=path, cwd=cwd, provider=provider, checkout=str(erb_root), checkout_head=state.head,
                        dirty_files=state.dirty_files, src_tree_sha256=tree, patch_sha256=patches,
-                       corpus_sha256=corpus, src_llm_sha256=src_llm, uuid_index_cache=str(path / UUID_INDEX_CACHE),
-                       identity=identity, links=links, rebuilt=rebuilt)
+                       corpus_identity=state.corpus["corpus_identity"], corpus_state=dict(state.corpus),
+                       uuid_index_sha256=uuid_index_sha256(erb_root), src_llm_sha256=src_llm,
+                       uuid_index_cache=str(path / UUID_INDEX_CACHE), identity=ident, links=links, rebuilt=rebuilt)
 
     previous = _read_overlay_state(final)
-    if final.is_dir() and previous.get("identity") == identity and (final / "src").is_dir():
+    if final.is_dir() and previous.get("identity") == ident and (final / "src").is_dir():
         return make(final, previous.get("links") or {}, rebuilt=False)   # reused as-is, never modified
     if final.exists():
         # Not a usable overlay (interrupted publish cannot leave this; tampering or an old layout can).
@@ -428,7 +471,7 @@ def evaluator_overlay(erb_root: Path, provider: str, *, allow_unpinned: bool = F
             os.replace(staging, final)
         except OSError:
             # Lost a race with another process publishing the same identity: use theirs.
-            if final.is_dir() and _read_overlay_state(final).get("identity") == identity:
+            if final.is_dir() and _read_overlay_state(final).get("identity") == ident:
                 shutil.rmtree(staging, ignore_errors=True)
                 return make(final, _read_overlay_state(final).get("links") or {}, rebuilt=False)
             raise
@@ -509,7 +552,28 @@ def _overlay_env(env: dict, ov: Overlay) -> dict:
 
 
 def _overlay_manifest(ov: Overlay) -> dict:
-    return {"overlay_dir": str(ov.path), "overlay_identity": ov.identity, "evaluator_overlay": ov.manifest_record()}
+    return {"overlay_dir": str(ov.path), "overlay_identity": ov.identity, "evaluator_overlay": ov.manifest_record(),
+            "corpus_identity": ov.corpus_identity, "corpus_state": dict(ov.corpus_state)}
+
+
+def corpus_check(ov: Overlay) -> dict:
+    """Read the checkout's corpus state again after the evaluator has finished and
+    compare it with the state the overlay (and the plan) was built from. The
+    overlay links to the mutable checkout, so a document edited while the
+    evaluator was running would have been judged against unknown content.
+    Returns the manifest fields; the caller writes the manifest and then raises."""
+    end = corpus_state(Path(ov.checkout))
+    changed = end["corpus_identity"] != ov.corpus_identity
+    return {"corpus_state_at_end": end, "corpus_changed_during_run": changed}
+
+
+def _corpus_changed_message(ov: Overlay, check: dict, results: Path) -> str:
+    end = check["corpus_state_at_end"]
+    return (f"corpus changed during judging: {ov.checkout} was {ov.corpus_identity[:12]} (HEAD "
+            f"{ov.corpus_state.get('head', '')[:12]}, dirty {ov.corpus_state.get('dirty')}) at start and is "
+            f"{end['corpus_identity'][:12]} (HEAD {end['head'][:12]}, dirty {end['dirty']}) now; results left in "
+            f"place at {results} but they were judged against unknown document content -- restore the checkout "
+            "and re-run with --fresh")
 
 
 def run_strict(cfg: RunConfig, run_dir: Path, erb_root: Path, questions: Path, answers: Path,
@@ -540,9 +604,12 @@ def run_strict(cfg: RunConfig, run_dir: Path, erb_root: Path, questions: Path, a
             raise CoverageError(f"COVERAGE FAILURE {results}: expected {question_id!r} among ids from {answers}")
     else:
         check_coverage(results, expected, expect_n)
+    check = corpus_check(ov)
     manifest.write_manifest(run_dir, "judge_strict", cfg.to_dict(), [results],
                             extra={"provider": cfg.judge.provider, "judge_model": cfg.judge.model,
-                                   "question_id": question_id, "expect_n": expect_n, **_overlay_manifest(ov)})
+                                   "question_id": question_id, "expect_n": expect_n, **_overlay_manifest(ov), **check})
+    if check["corpus_changed_during_run"]:
+        raise EvaluatorFailed(_corpus_changed_message(ov, check, results))
     return results
 
 
@@ -565,7 +632,8 @@ def shard_plan(cfg: RunConfig, answers: Path, questions: Path, ov: Overlay) -> d
     plan = {"answers_sha256": manifest.sha256_file(answers), "questions_sha256": manifest.sha256_file(questions),
             "provider": cfg.judge.provider, "model": cfg.judge.model, "cheap_model": cfg.judge.cheap_model,
             "shard_parallelism": cfg.judge.shard_parallelism, "shard_count": len(shards),
-            "overlay_identity": ov.plan_identity, "corpus_identity": ov.corpus_sha256,
+            "overlay_identity": ov.plan_identity, "corpus_identity": ov.corpus_identity,
+            "corpus_state": dict(ov.corpus_state),
             "answers": str(answers.resolve()), "questions": str(questions.resolve()),
             "overlay_dir": str(ov.path), "shards": shards}
     plan["fingerprint"] = plan_fingerprint(plan)
@@ -639,54 +707,26 @@ def prepare_shards(cfg: RunConfig, run_dir: Path, answers: Path, questions: Path
 
 # ------------------------------------------------------------------ lock --
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True             # exists, owned by someone else
-    except (OverflowError, ValueError, OSError):
-        return False
-    return True
-
-
-def acquire_lock(run_dir: Path) -> Path:
-    """Create ``<run_dir>/protocol_shards.lock`` atomically. Raises ``RunLocked``
-    while another live process holds it; a lock whose pid is dead is cleared with a note."""
+def acquire_lock(run_dir: Path) -> tuple[Path, str]:
+    """Take ``<run_dir>/protocol_shards.lock`` through ``identity.acquire_lock``:
+    the owner record (pid, token, start time, host) is published atomically with
+    the lock, so it is never observed empty and two acquirers can never both
+    succeed. Returns ``(lock path, owner token)``; ``release_lock`` needs the
+    token and removes the lock only when this process owns it. Raises
+    ``RunLocked`` while another live process holds it; a lock whose pid is dead
+    is cleared with a note and taken over."""
     lock = Path(run_dir) / LOCK_FILE
-    for _ in range(3):
-        try:
-            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            try:
-                info = json.loads(lock.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                info = {}
-            pid = info.get("pid")
-            if isinstance(pid, int) and _pid_alive(pid):
-                raise RunLocked(f"{run_dir} is being judged by pid {pid} since {info.get('started_at')} "
-                                f"(host {info.get('host')}); refusing a concurrent run. Remove {lock} only if "
-                                "that process is gone.") from None
-            print(f"  note: clearing stale lock {lock} (pid {pid} is not alive, started {info.get('started_at')})",
-                  flush=True)
-            try:
-                lock.unlink()
-            except FileNotFoundError:
-                pass
-            continue
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"pid": os.getpid(), "started_at": manifest.now_iso(), "host": platform.node(),
-                       "run_dir": str(run_dir)}, fh)
-        return lock
-    raise RunLocked(f"could not acquire {lock}")
-
-
-def release_lock(lock: Path) -> None:
     try:
-        Path(lock).unlink()
-    except FileNotFoundError:
-        pass
+        token = identity.acquire_lock(lock, what="judge_official")
+    except identity.Locked as exc:
+        raise RunLocked(f"{run_dir}: {exc}; refusing a concurrent run. Remove {lock} only if that process "
+                        "is gone.") from None
+    return lock, token
+
+
+def release_lock(lock: Path, token: str) -> None:
+    """Owner-checked release: a lock held by another owner (or token) is left alone."""
+    identity.release_lock(Path(lock), token)
 
 
 # ---------------------------------------------------------------- shards --
@@ -749,6 +789,84 @@ def merge_shards(ov: Overlay, shard_dir: Path, plan: dict, out: Path, expect_n: 
     return merged
 
 
+# ----------------------------------------------------------- corrections --
+
+def _write_jsonl_atomic(path: Path, rows: list[dict]) -> Path:
+    tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return path
+
+
+def correction_record(original: dict, updated: dict, source: str) -> dict:
+    """One ``corrections.jsonl`` record in the published format: the pinned
+    original as ``before``, the evaluator's updated row as ``after``."""
+    before = {"expected_doc_ids": list(original.get("expected_doc_ids") or []),
+              "gold_answer": original.get("gold_answer"), "answer_facts": list(original.get("answer_facts") or [])}
+    after = {"expected_doc_ids": list(updated.get("expected_doc_ids") or []),
+             "gold_answer": updated.get("gold_answer"), "answer_facts": list(updated.get("answer_facts") or []),
+             "valid_doc_ids": list(updated.get("valid_doc_ids") or [])}
+    return {"question_id": original["question_id"], "question_type": original.get("question_type"),
+            "before": before, "after": after, "update_reasons": updated.get("update_reasons") or {},
+            "doc_set_changed": set(before["expected_doc_ids"]) != set(after["expected_doc_ids"]),
+            "gold_answer_changed": before["gold_answer"] != after["gold_answer"], "source": source}
+
+
+def collect_corrections(shard_dir: Path, plan: dict, questions: Path) -> tuple[list[dict], list[dict]]:
+    """Corrections by SHARD OWNERSHIP. Every ``questions_updated_<sid>.jsonl``
+    holds all questions (the evaluator rewrites the whole questions file, with
+    its own corrections applied), so a global last-record-wins merge would let
+    one shard's untouched originals overwrite another shard's corrections. For
+    each shard only the rows whose id is in that shard's ``expected_ids`` AND
+    that carry ``updated: true`` are taken. Returns ``(records, effective rows)``
+    in questions-file order. A shard whose updated file is missing or unreadable
+    is an ``EvaluatorFailed``: its corrections cannot be recovered from the
+    results alone (the evaluator's ``--resume`` reloads them from that file)."""
+    try:
+        originals = validate.read_jsonl_rows(questions)
+    except (OSError, ValueError) as exc:
+        raise CoverageError(f"questions file unreadable: {questions}: {exc}") from None
+    by_id = {q["question_id"]: q for q in originals}
+    corrected: dict[str, tuple[dict, dict]] = {}
+    for s in plan["shards"]:
+        upd = shard_dir / s["updated"]
+        owned = set(s["expected_ids"])
+        try:
+            rows = validate.read_jsonl_rows(upd)
+        except FileNotFoundError:
+            raise EvaluatorFailed(f"shard {s['id']} left no {s['updated']} in {shard_dir}; its gold corrections "
+                                  "cannot be recovered from the results file alone: re-run with --fresh") from None
+        except (OSError, ValueError) as exc:
+            raise EvaluatorFailed(f"shard {s['id']}: {upd} unreadable: {exc}") from None
+        source = f"{s['updated']} written by the evaluator during this run"
+        for r in rows:
+            qid = r.get("question_id")
+            if qid not in owned or r.get("updated") is not True or qid not in by_id:
+                continue                      # another shard's copy of the question, or untouched
+            corrected[qid] = (correction_record(by_id[qid], r, source), r)
+    records = [corrected[q["question_id"]][0] for q in originals if q["question_id"] in corrected]
+    effective = [corrected[q["question_id"]][1] if q["question_id"] in corrected else q for q in originals]
+    return records, effective
+
+
+def export_corrections(run_dir: Path, shard_dir: Path, plan: dict, questions: Path) -> tuple[Path, Path]:
+    """Materialise ``<run_dir>/corrections.jsonl`` and ``<run_dir>/questions_effective.jsonl``
+    from the shard files (atomically; rewritten on every successful run). The
+    corrections file is written even when empty so ``verify`` knows corrections
+    were considered and scores the protocol results against the pinned gold."""
+    records, effective = collect_corrections(shard_dir, plan, questions)
+    corr = _write_jsonl_atomic(Path(run_dir) / CORRECTIONS, records)
+    eff = _write_jsonl_atomic(Path(run_dir) / QUESTIONS_EFFECTIVE, effective)
+    print(f"  corrections: {len(records)} gold corrections -> {corr.name}; effective questions -> {eff.name}", flush=True)
+    return corr, eff
+
+
+# ---------------------------------------------------------------- shards --
+
 def _run_shards(cfg: RunConfig, env: dict, ov: Overlay, shard_dir: Path, plan: dict, questions: Path,
                 todo: list[dict]) -> dict[str, int]:
     procs = []
@@ -786,7 +904,7 @@ def run_official(cfg: RunConfig, run_dir: Path, erb_root: Path, questions: Path,
     expected = set(validate_answers(answers, questions, expect_n))   # before any subprocess
     ov = evaluator_overlay(Path(erb_root), cfg.judge.provider, allow_unpinned=allow_unpinned)
     Path(run_dir).mkdir(parents=True, exist_ok=True)
-    lock = acquire_lock(run_dir)
+    lock, token = acquire_lock(run_dir)
     try:
         shard_dir, plan, archived = prepare_shards(cfg, run_dir, answers, questions, ov, fresh=fresh)
         done = [s["id"] for s in plan["shards"] if shard_complete(shard_dir, s)]
@@ -796,16 +914,23 @@ def run_official(cfg: RunConfig, run_dir: Path, erb_root: Path, questions: Path,
         attempts = _run_shards(cfg, env, ov, shard_dir, plan, questions, todo)
         merged = merge_shards(ov, shard_dir, plan, results, expect_n)
         check_coverage(results, expected, expect_n)
+        # (re)materialised on every successful merge, a no-op retry included, so the
+        # run directory always carries the corrections its protocol results were scored with
+        corrections, effective = export_corrections(run_dir, shard_dir, plan, questions)
+        check = corpus_check(ov)
     finally:
-        release_lock(lock)                   # released before the manifest so it never enters SHA256SUMS
+        release_lock(lock, token)            # released before the manifest so it never enters SHA256SUMS
     a = merged["aggregate_stats"]
     print(f"  merged: combined={a['combined_correctness_completeness_score']} correctness={a['average_correctness_pct']} "
           f"completeness={a['average_completeness_pct']} recall={a['average_recall_pct']} "
           f"corrected={a['num_corrected_questions']}", flush=True)
-    manifest.write_manifest(run_dir, "judge_official", cfg.to_dict(), [results, shard_dir / SHARD_PLAN],
+    manifest.write_manifest(run_dir, "judge_official", cfg.to_dict(),
+                            [results, shard_dir / SHARD_PLAN, corrections, effective],
                             extra={"provider": cfg.judge.provider, "judge_model": cfg.judge.model,
                                    "shards": plan["shard_count"], "plan_fingerprint": plan["fingerprint"],
                                    "shards_skipped": done, "shards_run": attempts,
                                    "archived_shards": str(archived) if archived else None,
-                                   "expect_n": expect_n, **_overlay_manifest(ov)})
+                                   "expect_n": expect_n, **_overlay_manifest(ov), **check})
+    if check["corpus_changed_during_run"]:
+        raise EvaluatorFailed(_corpus_changed_message(ov, check, results))
     return results

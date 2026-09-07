@@ -77,6 +77,24 @@ def _finite(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
+def _stat_problems(label: str, stored, recomputed) -> list[str]:
+    """A stored statistic must be a real, finite, correctly typed and bounded
+    number BEFORE it is compared with the recomputation (NaN compares as equal
+    to nothing, so a plain tolerance test would let it through)."""
+    if label.endswith(".count") or label.endswith("total_questions") or label.endswith("completed_questions"):
+        if isinstance(stored, bool) or not isinstance(stored, int) or stored < 0:
+            return [f"{label} = {stored!r} is not a non-negative integer"]
+        return [] if stored == recomputed else [f"{label} = {stored} but recomputed {recomputed}"]
+    if not _finite(stored):
+        return [f"{label} = {stored!r} is not a finite number"]
+    hi = 10**9 if "invalid_extra" in label else 100
+    if not 0 <= stored <= hi:
+        return [f"{label} = {stored} is out of range [0, {hi}]"]
+    if abs(float(stored) - float(recomputed)) > 0.011:
+        return [f"{label} = {stored} but recomputed {recomputed}"]
+    return []
+
+
 def _row_metric_problems(r: dict) -> str | None:
     if not isinstance(r["answer_correct"], bool):
         return "answer_correct is not a bool"
@@ -136,8 +154,8 @@ def check_results_file(path: Path, expected: set[str] | None) -> tuple[list[str]
                 continue
             if k not in agg:
                 problems.append(f"{path.name}: aggregate_stats.{k} missing")
-            elif abs(float(agg[k]) - float(rec[k])) > 0.011:
-                problems.append(f"{path.name}: aggregate_stats.{k} = {agg[k]} but recomputed {rec[k]}")
+            else:
+                problems += _stat_problems(f"{path.name}: aggregate_stats.{k}", agg[k], rec[k])
     qts = data.get("question_type_stats")
     if not isinstance(qts, dict):
         problems.append(f"{path.name}: question_type_stats missing")
@@ -154,8 +172,8 @@ def check_results_file(path: Path, expected: set[str] | None) -> tuple[list[str]
             for k in STAT_KEYS:
                 if k not in qts[t]:
                     problems.append(f"{path.name}: question_type_stats.{t}.{k} missing")
-                elif abs(float(qts[t][k]) - float(rec[k])) > 0.011:
-                    problems.append(f"{path.name}: question_type_stats.{t}.{k} = {qts[t][k]} but recomputed {rec[k]}")
+                else:
+                    problems += _stat_problems(f"{path.name}: question_type_stats.{t}.{k}", qts[t][k], rec[k])
     return problems, data
 
 
@@ -271,7 +289,7 @@ def gold_sets(questions_path: Path, corrections_path: Path | None) -> dict[str, 
     corrected 'after' state where a correction record exists."""
     out = {}
     for q in read_jsonl_rows(questions_path):
-        out[q["question_id"]] = (set(q.get("expected_doc_ids") or []), set())
+        out[q["question_id"]] = (set(q.get("expected_doc_ids") or []), set(q.get("valid_doc_ids") or []))
     if corrections_path and corrections_path.exists():
         for c in read_jsonl_rows(corrections_path):
             after = c.get("after", {})
@@ -308,11 +326,16 @@ def check_retrieval_metrics(run_dir: Path, questions_path: Path) -> list[str]:
                 continue
             gold, valid = golds[r["question_id"]]
             rec, extra = retrieval_metrics(a["document_ids"], gold, valid)
-            if rec is not None and r.get("document_recall_pct") is not None and abs(rec - float(r["document_recall_pct"])) > 0.011:
+            if rec is not None and (r.get("document_recall_pct") is None or r.get("invalid_extra_docs") is None):
+                n_bad += 1
+                if n_bad <= 5:
+                    problems.append(f"{name}: {r['question_id']} has gold documents but null retrieval metrics")
+                continue
+            if rec is not None and abs(rec - float(r["document_recall_pct"])) > 0.011:
                 n_bad += 1
                 if n_bad <= 5:
                     problems.append(f"{name}: {r['question_id']} document_recall_pct {r['document_recall_pct']} but submitted ids give {rec}")
-            if extra is not None and r.get("invalid_extra_docs") is not None and extra != r["invalid_extra_docs"]:
+            if extra is not None and extra != r["invalid_extra_docs"]:
                 n_bad += 1
                 if n_bad <= 5:
                     problems.append(f"{name}: {r['question_id']} invalid_extra_docs {r['invalid_extra_docs']} but submitted ids give {extra}")

@@ -248,3 +248,202 @@ def test_corrections_audit_detects_missing_record(tmp_path):
     rows = validate.read_jsonl_rows(ART / "corrections.jsonl")[1:]
     _write_contexts(tmp_path / "corrections.jsonl", rows)
     assert cli.main(["audit-corrections", "--run-dir", str(tmp_path), "--questions", str(QUESTIONS)]) == 1
+
+
+# ------------------------------------------------- release re-review (0d7c6ba) -----
+
+def _fixture_run(tmp_path, n=3):
+    """A small completed generation run against a mocked HydraDB (no store: chunk fallback)."""
+    from test_lifecycle import FakeQuery
+
+    class NoStore:
+        backend = "test"
+        identity = {"backend": "test"}
+
+        def get(self, d):
+            return None
+
+    rows = [{"question_id": f"q{i}", "question": f"Q{i}", "question_type": "basic"} for i in range(1, n + 1)]
+    qpath = tmp_path / "questions.jsonl"
+    qpath.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    run = tmp_path / "run"
+    with patch("erb_hydradb.hydradb_client.HydraDBQueryClient", FakeQuery), \
+            patch.object(generate, "generate_answer", return_value=("A", {})):
+        asyncio.run(generate.run_generate(RunConfig(), run, rows, api_key="mock", store=NoStore(),
+                                          questions_path=qpath))
+    return run, qpath, rows, NoStore()
+
+
+def _rerun(run, qpath, rows, store, **kw):
+    from test_lifecycle import FakeQuery
+    with patch("erb_hydradb.hydradb_client.HydraDBQueryClient", FakeQuery), \
+            patch.object(generate, "generate_answer", return_value=("A2", {})):
+        return asyncio.run(generate.run_generate(RunConfig(), run, rows, api_key="mock", store=store,
+                                                 questions_path=qpath, **kw))
+
+
+def test_torn_attempt_record_is_quarantined_and_resume_converges(tmp_path):
+    """P2-3: an interrupted append leaves half a JSON line; resume must not crash,
+    must keep the committed attempts, and must end with a run that verifies."""
+    run, qpath, rows, store = _fixture_run(tmp_path)
+    attempts = run / generate.ATTEMPTS
+    before = validate.read_jsonl_rows(attempts)
+    # simulate a crash mid-append: partial record without newline, and drop q3 from the checkpoint
+    with open(attempts, "a", encoding="utf-8") as f:
+        f.write('{"question_id": "q3", "attempt": 99, "context": "half wri')
+    ck = json.loads((run / "gen_checkpoint.json").read_text())
+    ck = [ck[0]] + [r for r in ck[1:] if r["question_id"] != "q3"]
+    (run / "gen_checkpoint.json").write_text(json.dumps(ck))
+    with pytest.raises(ValueError, match="invalid JSON"):
+        validate.read_jsonl_rows(attempts)   # the strict reader sees the torn record
+    out, inc = _rerun(run, qpath, rows, store)
+    assert inc is None and {r["question_id"] for r in out} == {"q1", "q2", "q3"}
+    torn = list(run.glob(generate.ATTEMPTS + ".torn-*"))
+    assert len(torn) == 1 and "half wri" in torn[0].read_text()
+    after = validate.read_jsonl_rows(attempts)
+    assert after[:len(before)] == before and after[-1]["question_id"] == "q3" and after[-1]["attempt"] == len(before) + 1
+    report = validate.validate_run(run, qpath, required=("SHA256SUMS",))
+    assert report["ok"], validate.format_report(report)
+
+
+def test_mid_journal_corruption_is_an_error_not_skipped(tmp_path):
+    from erb_hydradb import identity
+    j = tmp_path / "j.jsonl"
+    j.write_text('{"a": 1}\nnot json\n{"a": 2}\n')
+    with pytest.raises(ValueError, match="malformed record at line 2"):
+        identity.read_journal(j)
+    assert j.read_text() == '{"a": 1}\nnot json\n{"a": 2}\n'   # untouched
+
+
+def test_narrowed_selection_is_refused_before_writing(tmp_path):
+    """P2-5: a checkpoint with q1..q3 must not be resumed with --n 1 / --targets q1:
+    answers.jsonl and contexts.jsonl.gz would export fewer rows than the checkpoint."""
+    # CLI path: replay run over three questions, then the same run narrowed to one
+    ctx = _fake_context()
+    contexts = tmp_path / "contexts.jsonl"
+    _write_contexts(contexts, [{"question_id": f"q{i}", **ctx, "retrieved_doc_ids": ["d1"]} for i in (1, 2, 3)])
+    qpath = tmp_path / "questions.jsonl"
+    qpath.write_text("".join(json.dumps({"question_id": f"q{i}", "question": f"Q{i}"}) + "\n" for i in (1, 2, 3)))
+    cfg_path = tmp_path / "cfg.yaml"
+    RunConfig().save(cfg_path)
+    run = tmp_path / "run_cli"
+    base = ["generate", "--allow-unpinned", "--config", str(cfg_path), "--questions", str(qpath),
+            "--run-dir", str(run), "--from-contexts", str(contexts)]
+    with patch("erb_hydradb.llm.provider_available", return_value=True), \
+            patch.object(generate, "generate_answer", return_value=("A", {"pass1": True})):
+        assert cli.main(base) == 0
+        sums_before = (run / "SHA256SUMS").read_bytes()
+        (run / "config.yaml").unlink()
+        with patch.object(generate, "generate_answer") as call, pytest.raises(SystemExit, match="narrower selection"):
+            cli.main(base + ["--n", "1"])
+        assert call.call_count == 0
+        assert not (run / "config.yaml").exists()          # refused before the CLI wrote anything
+        assert (run / "SHA256SUMS").read_bytes() == sums_before
+
+    # library path, forced: the extra rows stay exported and the run still verifies
+    run, qpath, rows, store = _fixture_run(tmp_path)
+    with pytest.raises(SystemExit, match="narrower selection"):
+        _rerun(run, qpath, rows[:1], store)
+    out, inc = _rerun(run, qpath, rows[:1], store, force_resume=True)
+    assert inc is None and [r["question_id"] for r in out] == ["q1", "q2", "q3"]
+    assert {r["question_id"] for r in validate.read_jsonl_rows(run / "answers.jsonl")} == {"q1", "q2", "q3"}
+    assert validate.validate_run(run, qpath, required=("SHA256SUMS",))["ok"]
+    # the same run dir with the full selection again is fine without force
+    out, inc = _rerun(run, qpath, rows, store)
+    assert inc is None and len(out) == 3
+
+
+def test_narrowing_with_force_still_refuses_incomplete_extra_rows(tmp_path):
+    run, qpath, rows, store = _fixture_run(tmp_path)
+    ck = json.loads((run / "gen_checkpoint.json").read_text())
+    for r in ck[1:]:
+        if r["question_id"] == "q3":
+            r["stage"] = "retrieved"
+    (run / "gen_checkpoint.json").write_text(json.dumps(ck))
+    with pytest.raises(SystemExit, match="not complete"):
+        _rerun(run, qpath, rows[:2], store, force_resume=True)
+
+
+@pytest.mark.parametrize("field,value,needle", [
+    ("count", float("nan"), "not a non-negative integer"),
+    ("count", True, "not a non-negative integer"),
+    ("count", "12", "not a non-negative integer"),
+    ("average_recall_pct", float("nan"), "not a finite number"),
+    ("average_recall_pct", None, "not a finite number"),
+    ("average_recall_pct", "96.63", "not a finite number"),
+    ("average_recall_pct", 101, "out of range"),
+    ("combined_correctness_completeness_score", -1, "out of range"),
+])
+def test_category_statistics_must_be_typed_finite_and_bounded(tmp_path, field, value, needle):
+    """P2-7: NaN compares unequal to everything, so a tolerance test alone let it through."""
+    data = _results()
+    data["question_type_stats"]["basic"][field] = value
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps(data))
+    problems, _ = validate.check_results_file(p, None)
+    assert any(f"question_type_stats.basic.{field}" in x and needle in x for x in problems), problems
+
+
+def test_aggregate_statistics_must_be_typed_finite_and_bounded(tmp_path):
+    data = _results()
+    data["aggregate_stats"]["average_completeness_pct"] = float("nan")
+    data["aggregate_stats"]["completed_questions"] = 1.5
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps(data))
+    problems, _ = validate.check_results_file(p, None)
+    assert any("aggregate_stats.average_completeness_pct" in x and "finite" in x for x in problems)
+    assert any("aggregate_stats.completed_questions" in x for x in problems)
+
+
+def test_null_retrieval_metrics_with_gold_documents_fail_verification(tmp_path):
+    """P2-7: a null document_recall_pct on a question that has gold documents is not
+    'not applicable', it is a missing measurement."""
+    import shutil
+    run = tmp_path / "run"
+    shutil.copytree(ART, run)
+    p = run / "official_results_strict.json"
+    d = json.loads(p.read_text())
+    victim = next(q for q in d["questions"] if q.get("document_recall_pct") is not None)
+    victim["document_recall_pct"] = None
+    victim["invalid_extra_docs"] = None
+    p.write_text(json.dumps(d))
+    problems = validate.check_retrieval_metrics(run, QUESTIONS)
+    assert any(victim["question_id"] in x and "null retrieval metrics" in x for x in problems), problems
+
+
+def test_gold_sets_carry_the_pinned_valid_doc_ids(tmp_path):
+    """valid_doc_ids from the questions file must count as valid, not only those from corrections."""
+    q = tmp_path / "q.jsonl"
+    q.write_text(json.dumps({"question_id": "q1", "expected_doc_ids": ["g1"], "valid_doc_ids": ["v1", "v2"]}) + "\n")
+    golds = validate.gold_sets(q, None)
+    assert golds["q1"] == ({"g1"}, {"v1", "v2"})
+    assert validate.retrieval_metrics(["g1", "v1", "x"], *golds["q1"]) == (100.0, 1)
+    c = tmp_path / "corrections.jsonl"
+    c.write_text(json.dumps({"question_id": "q1", "after": {"expected_doc_ids": ["g2"], "valid_doc_ids": ["v3"]}}) + "\n")
+    assert validate.gold_sets(q, c)["q1"] == ({"g2"}, {"v3"})
+
+
+def test_valid_set_only_correction_records_are_accepted_by_the_audit(tmp_path):
+    """The evaluator marks a question `updated` when it only gained valid_doc_ids; the
+    results row is then NOT flagged corrected. Such a record must be exported (it changes
+    invalid_extra_docs) and must pass the audit; a record that changes nothing must not."""
+    import shutil
+    run = tmp_path / "run"
+    run.mkdir()
+    for name in ("official_results_protocol.json", "answers.jsonl"):
+        shutil.copy2(ART / name, run / name)
+    records = validate.read_jsonl_rows(ART / "corrections.jsonl")
+    results = {r["question_id"]: r for r in analysis.load_results(run / "official_results_protocol.json")["questions"]}
+    qs = {q["question_id"]: q for q in validate.read_jsonl_rows(QUESTIONS)}
+    victim = next(q for q, r in results.items() if not r.get("corrected") and qs[q].get("expected_doc_ids"))
+    orig = qs[victim]
+    rec = {"question_id": victim, "question_type": orig["question_type"],
+           "before": {k: orig.get(k) for k in ("expected_doc_ids", "gold_answer", "answer_facts")},
+           "after": {**{k: orig.get(k) for k in ("expected_doc_ids", "gold_answer", "answer_facts")},
+                     "valid_doc_ids": ["dsid_extra_valid"]},
+           "update_reasons": ["valid only"], "doc_set_changed": False, "gold_answer_changed": False, "source": "test"}
+    (run / "corrections.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records + [rec]))
+    assert cli.main(["audit-corrections", "--run-dir", str(run), "--questions", str(QUESTIONS)]) == 0
+    rec["after"]["valid_doc_ids"] = []
+    (run / "corrections.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records + [rec]))
+    assert cli.main(["audit-corrections", "--run-dir", str(run), "--questions", str(QUESTIONS)]) == 1

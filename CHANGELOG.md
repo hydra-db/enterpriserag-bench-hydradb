@@ -2,8 +2,30 @@
 
 ## Unreleased (release candidate for 1.0.0)
 
-Two rounds of external review before publication. Nothing in the published
+Three rounds of external review before publication. Nothing in the published
 artifacts changed; the harness around them did.
+
+- Corpora are identified by content everywhere (`identity.py`): a sqlite corpus
+  by a streaming sha256 over every row, a benchmark checkout by its git HEAD plus
+  the content of anything modified or untracked under `generated_data/` and
+  `questions.jsonl`. Ingestion, generation and judging refuse to resume against
+  a corpus whose content changed under the same label; judging re-checks the
+  corpus at the end of a run. Ingestion also binds the normalised endpoint.
+- The official protocol materialises `corrections.jsonl` (by shard ownership:
+  each shard contributes only the corrections of the questions it judged) and
+  `questions_effective.jsonl`, so `verify`, `audit-corrections` and `report`
+  see the gold set the scores were computed against.
+- Append-only journals (attempt history, ingestion status log) tolerate a torn
+  trailing record left by an interrupted write: it is quarantined to a
+  `.torn-<timestamp>` file and the run resumes; corruption anywhere else is an
+  error. Locks are published atomically with their owner record and released
+  only by their owner.
+- A run directory can be continued or extended but not narrowed: resuming with
+  a smaller `--targets` / `--n` selection is refused before anything is
+  written (`--force-resume` exports the completed extra rows as well).
+- Validation types every statistic (integer counts, finite bounded
+  percentages) before comparing it, and treats null retrieval metrics on a
+  question with gold documents as a failure; pinned `valid_doc_ids` count.
 
 - Verification cannot falsely succeed: one validator checks files, manifest
   hashes (latest writer wins), schema with finite bounded metrics, unique ids,

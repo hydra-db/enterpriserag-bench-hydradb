@@ -97,7 +97,14 @@ both outcomes. Do not overwrite the original.
 Retries: the official protocol runs as 20 shards. If some fail, re-run the same
 command; completed shards are kept and only the missing ones are judged. Use
 `--fresh` only to deliberately judge everything again (the previous shard
-directory is archived, not deleted).
+directory is archived, not deleted). After a successful merge the command writes
+`corrections.jsonl` (one record per question whose gold set the protocol
+changed, taken from the shard that judged it) and `questions_effective.jsonl`
+(the questions with those corrections applied); `verify`, `audit-corrections`
+and `report` read the former, so retrieval metrics are checked against the gold
+set the scores were computed with. The corpus (checkout HEAD plus any local edit
+under `generated_data/`) is recorded at the start of every judge run and checked
+again at the end; a change in between fails the run.
 
 ## Level 2 — regenerate answers from our saved contexts
 
@@ -148,8 +155,12 @@ R=data/runs/full
 Variants: `--targets ids.txt` or `--n 50` for a pilot; `--retrieval-only` to
 measure recall with no LLM cost (then `recall`); a copy of the config with
 `retrieval.mode: fast` for the fast/thinking ablation. A run directory is bound
-to its configuration, questions file and (for replay) contexts file; resuming
-under a different one is refused, so use a new directory per variant. A
+to its configuration, questions file, (for replay) contexts file and the content
+of the document store; resuming under a different one is refused, so use a new
+directory per variant. A run directory can be continued or extended (a larger
+selection) but not narrowed: resuming with fewer questions than the checkpoint
+holds is refused before anything is written, because `answers.jsonl` and
+`contexts.jsonl.gz` would then export fewer rows than the checkpoint. A
 retrieval-only run can be continued into generation in the same directory: the
 saved retrieval is reused and only the answers are generated.
 
@@ -188,7 +199,11 @@ config file.
 | `checkout ... is at X, not the pinned ...` | wrong benchmark revision | `erb-hydradb setup`, or `--allow-unpinned` (recorded; results not comparable) |
 | `questions.jsonl sha256 ... does not match` | wrong questions file | same as above |
 | `published contexts rejected` | the contexts file is malformed or incomplete | nothing was spent; check the listed problems |
-| `Refusing to resume ...: different run identity` | config, questions or contexts changed | new `--run-dir` (or `--force-resume`, recorded) |
+| `Refusing to resume ...: different run identity` | config, questions, contexts or corpus content changed | new `--run-dir` (or `--force-resume`, recorded) |
+| `Refusing to resume ... narrower selection` | the checkpoint has questions this selection drops | select a superset, or a new `--run-dir` |
+| `journal: quarantined an incomplete trailing record` | a previous run was interrupted mid-write | nothing to do; the fragment is kept in a `.torn-*` file |
+| `corpus changed during judging` | a checkout file under `generated_data/` changed while the evaluator ran | restore the checkout (`git status` in it) and re-run with `--fresh` |
+| `is held by pid ...` | another process is working in this run directory | wait, or remove `*.lock` only if that pid is really gone |
 | HTTP 401 / 403 | bad key or no access to that database | check `.env` and the database name |
 | HTTP 429 | rate limit | the client backs off and retries; slow batches with `--batch-sleep` |
 | timeouts / connection errors | transient | safe to re-run every command; generate/ingest/judge resume |
