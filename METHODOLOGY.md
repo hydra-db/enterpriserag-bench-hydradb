@@ -149,6 +149,18 @@ numbers are the unadjusted run.
 
 ## 7. Provenance
 
+Two equivalence checks were run when this package was assembled from the code
+that produced the published run:
+
+- the conversion in `convert.py` produces output identical to the original
+  converter for every one of the 511,962 documents in the pinned checkout
+  (6,038,192 typed items, compared as sorted JSON and on per-item key order);
+- `hydrate.build_context` applied to the saved retrieval order reproduces the
+  published context sha256 for every question checked (25 of 25), i.e. the
+  contexts in `contexts.jsonl.gz` are a pure function of the retrieval order and
+  the benchmark's canonical document text.
+
+
 Every stage writes to `manifest.json` in the run directory: package version,
 repository commit, Python version, the full config, the pinned upstream
 identifiers, and sha256 of every file it produced; `SHA256SUMS` covers the whole
